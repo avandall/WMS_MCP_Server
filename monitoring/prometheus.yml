@@ -1,0 +1,40 @@
+# Prometheus configuration for WMS MCP Server monitoring
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: 'wms-mcp-server'
+    environment: 'production'
+
+scrape_configs:
+  - job_name: 'wms-mcp-server'
+    static_configs:
+      - targets: ['wms-mcp-server:8000']
+    scrape_interval: 10s
+    metrics_path: '/metrics'
+    
+  - job_name: 'postgres'
+    static_configs:
+      - targets: ['postgres:5432']
+    scrape_interval: 30s
+    
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['redis:6379']
+    scrape_interval: 30s
+    
+  - job_name: 'rabbitmq'
+    static_configs:
+      - targets: ['rabbitmq:15672']
+    scrape_interval: 30s
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            # Add alertmanager if needed
+            # - alertmanager:9093
+
+rule_files:
+  - 'alerting_rules.yml'
