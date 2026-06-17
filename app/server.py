@@ -130,19 +130,29 @@ class WMSServer:
 
 async def register_tools_from_categories():
     """Register tools from all categories"""
-    # This will be populated when we implement actual tools
-    # For now, we'll register placeholder tools from each category
-    
+    # Register core tools (Phase 2)
     from app.tools.inventory import register_inventory_tools
     from app.tools.transactions import register_transaction_tools
     from app.tools.monitoring import register_monitoring_tools
     from app.tools.alerts import register_alerts_tools
+    
+    # Register advanced tools (Phase 3)
+    from app.tools.orders import register_order_tools
+    from app.tools.picking import register_picking_tools
+    from app.tools.procurement import register_procurement_tools
+    from app.tools.users import register_user_tools
+    from app.tools.shipping import register_shipping_tools
     
     # Register tools from each category
     register_inventory_tools(registry)
     register_transaction_tools(registry)
     register_monitoring_tools(registry)
     register_alerts_tools(registry)
+    register_order_tools(registry)
+    register_picking_tools(registry)
+    register_procurement_tools(registry)
+    register_user_tools(registry)
+    register_shipping_tools(registry)
     
     logger.info(f"Registered {registry.get_tool_count()} tools from all categories")
 

@@ -1,8 +1,8 @@
 """Procurement tools"""
 
 from app.tools.registry import ToolRegistry
+from app.tools.procurement.verify_incoming_po import VerifyIncomingPO
 
 def register_procurement_tools(registry: ToolRegistry):
     """Register all procurement tools"""
-    # Placeholder - will be populated in Phase 3
-    pass
+    registry.register(VerifyIncomingPO, category="procurement")
