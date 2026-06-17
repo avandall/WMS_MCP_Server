@@ -101,3 +101,9 @@ redis==5.0.0
     # via wms-mcp-server
 aio-pika==9.0.0
     # via wms-mcp-server
+pytest==7.4.0
+    # via wms-mcp-server
+pytest-asyncio==0.21.0
+    # via wms-mcp-server
+pytest-cov==4.1.0
+    # via wms-mcp-server

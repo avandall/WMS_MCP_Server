@@ -6,6 +6,8 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 import json
+from datetime import datetime
+import asyncio
 
 from app.config import get_config
 from app.tools.registry import get_global_registry
@@ -21,6 +23,15 @@ logger = logging.getLogger(__name__)
 # Initialize configuration and registry
 config = get_config()
 registry = get_global_registry()
+
+# Server metrics
+server_metrics = {
+    "start_time": datetime.utcnow().isoformat(),
+    "tool_calls": 0,
+    "successful_calls": 0,
+    "failed_calls": 0,
+    "total_execution_time_ms": 0
+}
 
 
 class WMSServer:
@@ -60,12 +71,14 @@ class WMSServer:
         @self.server.call_tool()
         async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
             """Call a specific tool"""
+            server_metrics["tool_calls"] += 1
             logger.info(f"Tool called: {name} with arguments: {arguments}")
             
             # Check if tool is enabled
             if not config.is_tool_enabled(name):
                 error_msg = f"Tool '{name}' is disabled"
                 logger.warning(error_msg)
+                server_metrics["failed_calls"] += 1
                 return [TextContent(
                     type="text",
                     text=json.dumps({
@@ -80,6 +93,7 @@ class WMSServer:
             if not tool:
                 error_msg = f"Tool '{name}' not found"
                 logger.error(error_msg)
+                server_metrics["failed_calls"] += 1
                 return [TextContent(
                     type="text",
                     text=json.dumps({
@@ -93,6 +107,15 @@ class WMSServer:
             try:
                 result = await tool.execute_with_timing(**arguments)
                 
+                # Update metrics
+                if result.success:
+                    server_metrics["successful_calls"] += 1
+                else:
+                    server_metrics["failed_calls"] += 1
+                
+                if result.execution_time_ms:
+                    server_metrics["total_execution_time_ms"] += result.execution_time_ms
+                
                 # Log execution
                 tool.log_execution(arguments, result)
                 
@@ -104,6 +127,7 @@ class WMSServer:
                 
             except Exception as e:
                 logger.error(f"Error executing tool {name}: {e}", exc_info=True)
+                server_metrics["failed_calls"] += 1
                 error_result = ToolResult(
                     success=False,
                     error=str(e),
