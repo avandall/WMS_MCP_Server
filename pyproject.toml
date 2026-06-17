@@ -8,4 +8,7 @@ dependencies = [
     "dotenv>=0.9.9",
     "httpx>=0.28.1",
     "mcp>=1.27.2",
+    "asyncpg>=0.29.0",
+    "redis>=5.0.0",
+    "aio-pika>=9.0.0",
 ]
