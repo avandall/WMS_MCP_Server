@@ -1,0 +1,193 @@
+---
+# Ansible playbook for disaster recovery
+
+- name: Configure Disaster Recovery
+  hosts: wms_servers
+  become: yes
+  
+  tasks:
+    - name: Install backup tools
+      apt:
+        name:
+          - awscli
+          - rclone
+        state: present
+    
+    - name: Create backup directory
+      file:
+        path: /opt/backups
+        state: directory
+        mode: '0755'
+    
+    - name: Configure database backup script
+      copy:
+        content: |
+          #!/bin/bash
+          DATE=$(date +%Y%m%d_%H%M%S)
+          BACKUP_DIR="/opt/backups"
+          DB_NAME="wms_mcp"
+          DB_USER="wms_user"
+          DB_HOST="localhost"
+          
+          pg_dump -h $DB_HOST -U $DB_USER $DB_NAME > $BACKUP_DIR/db_backup_$DATE.sql
+          gzip $BACKUP_DIR/db_backup_$DATE.sql
+          
+          # Upload to S3
+          aws s3 cp $BACKUP_DIR/db_backup_$DATE.sql.gz s3://wms-mcp-backups/database/
+          
+          # Keep only last 7 days of backups
+          find $BACKUP_DIR -name "db_backup_*.sql.gz" -mtime +7 -delete
+        dest: /usr/local/bin/db_backup.sh
+        mode: '0755'
+    
+    - name: Configure Redis backup script
+      copy:
+        content: |
+          #!/bin/bash
+          DATE=$(date +%Y%m%d_%H%M%S)
+          BACKUP_DIR="/opt/backups"
+          
+          redis-cli BGSAVE
+          sleep 5
+          
+          cp /var/lib/redis/dump.rdb $BACKUP_DIR/redis_backup_$DATE.rdb
+          gzip $BACKUP_DIR/redis_backup_$DATE.rdb
+          
+          # Upload to S3
+          aws s3 cp $BACKUP_DIR/redis_backup_$DATE.rdb.gz s3://wms-mcp-backups/redis/
+          
+          # Keep only last 7 days of backups
+          find $BACKUP_DIR -name "redis_backup_*.rdb.gz" -mtime +7 -delete
+        dest: /usr/local/bin/redis_backup.sh
+        mode: '0755'
+    
+    - name: Configure application backup script
+      copy:
+        content: |
+          #!/bin/bash
+          DATE=$(date +%Y%m%d_%H%M%S)
+          BACKUP_DIR="/opt/backups"
+          APP_DIR="/opt/wms-mcp-server"
+          
+          tar -czf $BACKUP_DIR/app_backup_$DATE.tar.gz $APP_DIR
+          
+          # Upload to S3
+          aws s3 cp $BACKUP_DIR/app_backup_$DATE.tar.gz s3://wms-mcp-backups/application/
+          
+          # Keep only last 7 days of backups
+          find $BACKUP_DIR -name "app_backup_*.tar.gz" -mtime +7 -delete
+        dest: /usr/local/bin/app_backup.sh
+        mode: '0755'
+    
+    - name: Schedule automated backups
+      cron:
+        name: "Database backup"
+        minute: "0"
+        hour: "2"
+        job: "/usr/local/bin/db_backup.sh"
+    
+    - name: Schedule Redis backups
+      cron:
+        name: "Redis backup"
+        minute: "30"
+        hour: "2"
+        job: "/usr/local/bin/redis_backup.sh"
+    
+    - name: Schedule application backups
+      cron:
+        name: "Application backup"
+        minute: "0"
+        hour: "3"
+        job: "/usr/local/bin/app_backup.sh"
+    
+    - name: Configure restore script
+      copy:
+        content: |
+          #!/bin/bash
+          BACKUP_TYPE=$1
+          BACKUP_FILE=$2
+          BACKUP_DIR="/opt/backups"
+          
+          case $BACKUP_TYPE in
+            database)
+              # Download from S3
+              aws s3 cp s3://wms-mcp-backups/database/$BACKUP_FILE $BACKUP_DIR/
+              gunzip $BACKUP_DIR/$BACKUP_FILE
+              
+              # Restore database
+              psql -h localhost -U wms_user -d wms_mcp < $BACKUP_DIR/${BACKUP_FILE%.gz}
+              ;;
+            redis)
+              # Download from S3
+              aws s3 cp s3://wms-mcp-backups/redis/$BACKUP_FILE $BACKUP_DIR/
+              gunzip $BACKUP_DIR/$BACKUP_FILE
+              
+              # Restore Redis
+              systemctl stop redis
+              cp $BACKUP_DIR/${BACKUP_FILE%.gz} /var/lib/redis/dump.rdb
+              systemctl start redis
+              ;;
+            application)
+              # Download from S3
+              aws s3 cp s3://wms-mcp-backups/application/$BACKUP_FILE $BACKUP_DIR/
+              gunzip $BACKUP_DIR/$BACKUP_FILE
+              
+              # Restore application
+              tar -xzf $BACKUP_DIR/${BACKUP_FILE%.gz} -C /opt/
+              ;;
+            *)
+              echo "Usage: $0 {database|redis|application} <backup_file>"
+              exit 1
+              ;;
+          esac
+        dest: /usr/local/bin/restore.sh
+        mode: '0755'
+
+- name: Configure High Availability
+  hosts: wms_servers
+  become: yes
+  
+  tasks:
+    - name: Install HAProxy
+      apt:
+        name: haproxy
+        state: present
+    
+    - name: Configure HAProxy
+      copy:
+        content: |
+          global
+              log /dev/log local0
+              log /dev/log local1 notice
+              chroot /var/lib/haproxy
+              stats socket /run/haproxy/admin.sock mode 660 level admin
+              stats timeout 30s
+              user haproxy
+              group haproxy
+              daemon
+          
+          defaults
+              log global
+              mode http
+              option httplog
+              option dontlognull
+              timeout connect 5000
+              timeout client 50000
+              timeout server 50000
+          
+          frontend wms_mcp_frontend
+              bind *:80
+              default_backend wms_mcp_backend
+          
+          backend wms_mcp_backend
+              balance roundrobin
+              server wms1 10.0.1.10:8000 check
+              server wms2 10.0.2.10:8000 check
+        dest: /etc/haproxy/haproxy.cfg
+        mode: '0644'
+    
+    - name: Enable and start HAProxy
+      systemd:
+        name: haproxy
+        enabled: yes
+        state: restarted

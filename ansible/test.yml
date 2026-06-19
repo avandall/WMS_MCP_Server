@@ -1,0 +1,57 @@
+---
+# Ansible playbook for infrastructure testing
+
+- name: Test Infrastructure
+  hosts: wms_servers
+  become: yes
+  
+  tasks:
+    - name: Check if WMS MCP Server is running
+      uri:
+        url: http://localhost:8000/health
+        method: GET
+        status_code: 200
+      register: health_check
+      until: health_check.status == 200
+      retries: 5
+      delay: 5
+    
+    - name: Check database connectivity
+      command: pg_isready -h localhost -p 5432 -U wms_user
+      register: db_check
+      ignore_errors: yes
+    
+    - name: Check Redis connectivity
+      command: redis-cli ping
+      register: redis_check
+      ignore_errors: yes
+    
+    - name: Check disk space
+      command: df -h /
+      register: disk_space
+    
+    - name: Check memory usage
+      command: free -m
+      register: memory_usage
+    
+    - name: Check CPU usage
+      command: top -bn1 | grep "Cpu(s)"
+      register: cpu_usage
+    
+    - name: Verify all services are running
+      service_facts:
+    
+    - name: Check WMS MCP Server service
+      assert:
+        that:
+          - ansible_facts.services['wms-mcp-server.service'].state == 'running'
+    
+    - name: Check Prometheus service
+      assert:
+        that:
+          - ansible_facts.services['prometheus.service'].state == 'running'
+    
+    - name: Check Grafana service
+      assert:
+        that:
+          - ansible_facts.services['grafana-server.service'].state == 'running'

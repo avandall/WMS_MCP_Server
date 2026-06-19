@@ -1,0 +1,153 @@
+name: Quality Gates
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  code-quality:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install flake8 black isort mypy pylint
+    
+    - name: Run flake8
+      run: flake8 app/ --max-line-length=100 --exclude=__pycache__
+    
+    - name: Run black
+      run: black --check --line-length=100 app/
+    
+    - name: Run isort
+      run: isort --check-only --profile black app/
+    
+    - name: Run mypy
+      run: mypy app/ --ignore-missing-imports
+    
+    - name: Run pylint
+      run: pylint app/ --fail-under=8.0
+
+  security-scan:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install bandit safety pip-audit
+    
+    - name: Run Bandit
+      run: bandit -r app/ -f json -o bandit-report.json
+    
+    - name: Run Safety
+      run: safety check --json > safety-report.json
+    
+    - name: Run pip-audit
+      run: pip-audit --format json > pip-audit-report.json
+    
+    - name: Upload security reports
+      uses: actions/upload-artifact@v3
+      with:
+        name: security-reports
+        path: |
+          bandit-report.json
+          safety-report.json
+          pip-audit-report.json
+
+  performance-test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install locust
+    
+    - name: Run performance tests
+      run: |
+        locust -f tests/performance/locustfile.py --headless --users 100 --spawn-rate 10 --run-time 60s --html performance-report.html
+    
+    - name: Upload performance report
+      uses: actions/upload-artifact@v3
+      with:
+        name: performance-report
+        path: performance-report.html
+
+  compliance-check:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: Run compliance tests
+      run: python tests/security/compliance_test.py
+    
+    - name: Check for hardcoded secrets
+      run: |
+        if grep -r "password\|secret\|api_key\|token" app/ --include="*.py" | grep -v "test\|example\|placeholder"; then
+          echo "Potential hardcoded secrets found"
+          exit 1
+        fi
+
+  documentation-generation:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install sphinx sphinx-rtd-theme
+    
+    - name: Generate documentation
+      run: |
+        cd docs
+        sphinx-build -b html . _build/html
+    
+    - name: Upload documentation
+      uses: actions/upload-artifact@v3
+      with:
+        name: documentation
+        path: docs/_build/html
