@@ -43,8 +43,10 @@ async def mock_db_client(test_config: Config) -> AsyncGenerator[DatabaseClient, 
     # Mock common database methods
     client.fetch_one = AsyncMock()
     client.fetch_many = AsyncMock(return_value=[])
+    client.fetch_val = AsyncMock()
     client.execute = AsyncMock(return_value="SELECT 1")
     client.execute_transaction = AsyncMock(return_value=True)
+    client.update_stock_quantity = AsyncMock(return_value=True)
     
     yield client
     
@@ -154,10 +156,4 @@ def sample_location_data():
     }
 
 
-# Async event loop fixture for pytest-asyncio
-@pytest.fixture(scope="session")
-def event_loop():
-    """Create event loop for async tests"""
-    loop = asyncio.get_event_loop_policy().new_event_loop()
-    yield loop
-    loop.close()
+

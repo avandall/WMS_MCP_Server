@@ -66,7 +66,7 @@ class CheckStockAvailability(BaseTool):
             if not stock_info:
                 return ToolResult(
                     success=False,
-                    error=f"No stock information found for SKU: {input_data.sku_code}",
+                    error=f"Stock information not found for SKU: {input_data.sku_code}",
                     error_code="NOT_FOUND"
                 )
             

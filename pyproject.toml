@@ -17,3 +17,7 @@ dependencies = [
 pytest = ">=7.4.0"
 pytest-asyncio = ">=0.21.0"
 pytest-cov = ">=4.1.0"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests/test_tools", "tests/test_integration", "tests/test_mcp"]

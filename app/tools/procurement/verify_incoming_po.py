@@ -1,6 +1,6 @@
 """Verify incoming PO tool"""
 
-from typing import Dict, Any
+from typing import Dict, Any, List
 from pydantic import BaseModel, Field
 from app.tools.base import BaseTool, ToolResult
 from app.clients.database_client import DatabaseClient

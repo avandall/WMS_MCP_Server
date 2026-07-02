@@ -57,7 +57,7 @@ class InspectShelfCapacity(BaseTool):
             if not shelf_info:
                 return ToolResult(
                     success=False,
-                    error=f"No shelf information found for location: {input_data.location_code}",
+                    error=f"Shelf information not found for location: {input_data.location_code}",
                     error_code="NOT_FOUND"
                 )
             

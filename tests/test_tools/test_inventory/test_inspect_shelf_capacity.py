@@ -92,7 +92,7 @@ async def test_inspect_shelf_capacity_input_validation():
     valid_input = InspectShelfCapacityInput(
         location_code="ZONE-A-ROW-01-SHELF-01"
     )
-    assert valid_input.location_code == "ZONE-A-ROW-01-SHELF-01
+    assert valid_input.location_code == "ZONE-A-ROW-01-SHELF-01"
     
     # Invalid input (missing required field)
     with pytest.raises(Exception):

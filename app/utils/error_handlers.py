@@ -26,6 +26,15 @@ def handle_tool_error(error: Exception, tool_name: str = "unknown") -> ToolResul
             error_code=error.error_code,
             details=error.details
         )
+    elif type(error).__name__ in ("ValidationError", "PydanticUserError"):
+        # Pydantic validation error
+        logger.warning(f"Validation error in tool {tool_name}: {error}")
+        return ToolResult(
+            success=False,
+            error=str(error),
+            error_code="VALIDATION_ERROR",
+            details={"tool_name": tool_name}
+        )
     else:
         # Generic exception
         logger.error(f"Unexpected error in tool {tool_name}: {error}", exc_info=True)

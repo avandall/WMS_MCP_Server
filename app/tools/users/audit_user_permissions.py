@@ -197,7 +197,7 @@ class AuditUserPermissions(BaseTool):
             "user_status": user_info.get('status'),
             "account_active": user_info.get('status') == 'ACTIVE',
             "permission_granted": has_permission,
-            "risk_level": self._get_permission_details(action).get('risk', 'Unknown'),
+            "risk_level": self._get_permission_details(action).get('risk', 'Unknown').upper(),
             "security_flags": []
         }
         

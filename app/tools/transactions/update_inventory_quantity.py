@@ -1,6 +1,6 @@
 """Update inventory quantity tool"""
 
-from typing import Dict, Any
+from typing import Dict, Any, Literal
 from pydantic import BaseModel, Field
 from app.tools.base import BaseTool, ToolResult
 from app.clients.database_client import DatabaseClient
@@ -19,7 +19,7 @@ class UpdateInventoryQuantityInput(BaseModel):
     """Input schema for update_inventory_quantity"""
     sku_code: str = Field(..., description="SKU code")
     location_code: str = Field(..., description="Location code")
-    action: str = Field(..., description="Action: INCREASE or DECREASE")
+    action: Literal["INCREASE", "DECREASE"] = Field(..., description="Action: INCREASE or DECREASE")
     quantity: int = Field(..., description="Quantity to increase/decrease")
 
 
