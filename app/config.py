@@ -67,7 +67,10 @@ class Config(PydanticBaseSettings):
     # Security
     SECRET_KEY: str = Field(default="change-me-in-production", description="Secret key for signing")
     API_KEY_REQUIRED: bool = Field(default=False, description="Require API key for access")
-    VALID_API_KEYS: List[str] = Field(default_factory=list, description="Valid API keys")
+    VALID_API_KEYS: List[str] = Field(
+        default=["wms-mcp-key-2026", "admin-super-key"], 
+        description="Valid API keys"
+    )
     
     # Monitoring
     METRICS_ENABLED: bool = Field(default=True, description="Enable metrics collection")

@@ -156,4 +156,75 @@ def sample_location_data():
     }
 
 
+@pytest.fixture(autouse=True)
+def mock_grpc_client(monkeypatch):
+    """Automatically mock all stubs in grpc_client for unit tests"""
+    from contextlib import asynccontextmanager
+    from app.integration.grpc_client import grpc_client
+    
+    mock_identity = AsyncMock()
+    mock_customer = AsyncMock()
+    mock_product = AsyncMock()
+    mock_warehouse = AsyncMock()
+    mock_inventory = AsyncMock()
+    mock_documents = AsyncMock()
+    mock_audit = AsyncMock()
+    mock_reporting = AsyncMock()
+    mock_ai = AsyncMock()
+    
+    # Mock ListProducts response
+    from app.gen.wms.product.v1 import product_pb2
+    mock_list_response = product_pb2.ListProductsResponse()
+    mock_list_response.products.add(product_id=1, name="SKU-TEST-001", price=100.0, description="Test Product")
+    mock_product.ListProducts.return_value = mock_list_response
+    
+    # Mock GetAvailability response
+    from app.gen.wms.inventory.v1 import inventory_pb2
+    mock_avail_response = inventory_pb2.GetAvailabilityResponse(
+        product_id=1,
+        warehouse_id=1,
+        physical_qty=100,
+        reserved_qty=20,
+        available_qty=80
+    )
+    mock_inventory.GetAvailability.return_value = mock_avail_response
+    
+    # Mock ConfirmInventoryTransaction response
+    mock_confirm_response = inventory_pb2.ConfirmInventoryTransactionResponse(
+        success=True,
+        transaction_id=123
+    )
+    mock_inventory.ConfirmInventoryTransaction.return_value = mock_confirm_response
+    
+    # Expose mocks on the singleton for individual test overrides
+    grpc_client.mock_identity = mock_identity
+    grpc_client.mock_customer = mock_customer
+    grpc_client.mock_product = mock_product
+    grpc_client.mock_warehouse = mock_warehouse
+    grpc_client.mock_inventory = mock_inventory
+    grpc_client.mock_documents = mock_documents
+    grpc_client.mock_audit = mock_audit
+    grpc_client.mock_reporting = mock_reporting
+    grpc_client.mock_ai = mock_ai
+    
+    # Patch the stubs context managers
+    @asynccontextmanager
+    async def dummy_stub(stub_mock):
+        yield stub_mock
+        
+    monkeypatch.setattr(grpc_client, "identity_stub", lambda: dummy_stub(mock_identity))
+    monkeypatch.setattr(grpc_client, "customer_stub", lambda: dummy_stub(mock_customer))
+    monkeypatch.setattr(grpc_client, "product_stub", lambda: dummy_stub(mock_product))
+    monkeypatch.setattr(grpc_client, "warehouse_stub", lambda: dummy_stub(mock_warehouse))
+    monkeypatch.setattr(grpc_client, "warehouse_ops_stub", lambda: dummy_stub(mock_warehouse))
+    monkeypatch.setattr(grpc_client, "inventory_stub", lambda: dummy_stub(mock_inventory))
+    monkeypatch.setattr(grpc_client, "documents_stub", lambda: dummy_stub(mock_documents))
+    monkeypatch.setattr(grpc_client, "audit_stub", lambda: dummy_stub(mock_audit))
+    monkeypatch.setattr(grpc_client, "reporting_stub", lambda: dummy_stub(mock_reporting))
+    monkeypatch.setattr(grpc_client, "ai_stub", lambda: dummy_stub(mock_ai))
+    
+    return grpc_client
+
+
+
 

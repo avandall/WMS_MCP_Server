@@ -74,6 +74,27 @@ class WMSServer:
             server_metrics["tool_calls"] += 1
             logger.info(f"Tool called: {name} with arguments: {arguments}")
             
+            # Check API Key if required
+            if config.API_KEY_REQUIRED:
+                import os
+                api_key = arguments.pop("api_key", None)
+                # Allow environment bypass for local shell / automated tests
+                if not api_key:
+                    api_key = os.getenv("WMS_MCP_API_KEY")
+                
+                if not api_key or api_key not in config.VALID_API_KEYS:
+                    error_msg = "Security Error: Missing or invalid API Key"
+                    logger.error(error_msg)
+                    server_metrics["failed_calls"] += 1
+                    return [TextContent(
+                        type="text",
+                        text=json.dumps({
+                            "success": False,
+                            "error": error_msg,
+                            "error_code": "UNAUTHORIZED"
+                        })
+                    )]
+            
             # Check if tool is enabled
             if not config.is_tool_enabled(name):
                 error_msg = f"Tool '{name}' is disabled"
@@ -159,6 +180,7 @@ async def register_tools_from_categories():
     from app.tools.transactions import register_transaction_tools
     from app.tools.monitoring import register_monitoring_tools
     from app.tools.alerts import register_alerts_tools
+    from app.tools.devops import register_devops_tools
     
     # Register advanced tools (Phase 3)
     from app.tools.orders import register_order_tools
@@ -172,6 +194,7 @@ async def register_tools_from_categories():
     register_transaction_tools(registry)
     register_monitoring_tools(registry)
     register_alerts_tools(registry)
+    register_devops_tools(registry)
     register_order_tools(registry)
     register_picking_tools(registry)
     register_procurement_tools(registry)

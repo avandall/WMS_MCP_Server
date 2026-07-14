@@ -6,17 +6,15 @@ from app.tools.base import ToolResult
 
 
 @pytest.mark.asyncio
-async def test_update_inventory_quantity_increase(mock_db_client, mock_redis_client, test_config):
+async def test_update_inventory_quantity_increase(mock_grpc_client, mock_redis_client, test_config):
     """Test successful inventory quantity increase"""
     # Setup mocks
-    mock_db_client.update_stock_quantity.return_value = True
     mock_redis_client.acquire_lock.return_value = True
     mock_redis_client.release_lock.return_value = True
     mock_redis_client.cache_delete.return_value = True
     
     # Create tool instance
     tool = UpdateInventoryQuantity(test_config)
-    tool.db = mock_db_client
     tool.redis = mock_redis_client
     
     # Execute tool
@@ -31,23 +29,21 @@ async def test_update_inventory_quantity_increase(mock_db_client, mock_redis_cli
     assert result.success == True
     assert result.data["action"] == "INCREASE"
     assert result.data["quantity"] == 50
-    assert mock_db_client.update_stock_quantity.called
+    assert mock_grpc_client.mock_inventory.ConfirmInventoryTransaction.called
     assert mock_redis_client.acquire_lock.called
     assert mock_redis_client.release_lock.called
 
 
 @pytest.mark.asyncio
-async def test_update_inventory_quantity_decrease(mock_db_client, mock_redis_client, test_config):
+async def test_update_inventory_quantity_decrease(mock_grpc_client, mock_redis_client, test_config):
     """Test successful inventory quantity decrease"""
     # Setup mocks
-    mock_db_client.update_stock_quantity.return_value = True
     mock_redis_client.acquire_lock.return_value = True
     mock_redis_client.release_lock.return_value = True
     mock_redis_client.cache_delete.return_value = True
     
     # Create tool instance
     tool = UpdateInventoryQuantity(test_config)
-    tool.db = mock_db_client
     tool.redis = mock_redis_client
     
     # Execute tool
@@ -62,17 +58,17 @@ async def test_update_inventory_quantity_decrease(mock_db_client, mock_redis_cli
     assert result.success == True
     assert result.data["action"] == "DECREASE"
     assert result.data["quantity"] == 30
+    assert mock_grpc_client.mock_inventory.ConfirmInventoryTransaction.called
 
 
 @pytest.mark.asyncio
-async def test_update_inventory_quantity_lock_failure(mock_db_client, mock_redis_client, test_config):
+async def test_update_inventory_quantity_lock_failure(mock_redis_client, test_config):
     """Test handling when lock acquisition fails"""
     # Setup mocks
     mock_redis_client.acquire_lock.return_value = False
     
     # Create tool instance
     tool = UpdateInventoryQuantity(test_config)
-    tool.db = mock_db_client
     tool.redis = mock_redis_client
     
     # Execute tool
@@ -87,7 +83,6 @@ async def test_update_inventory_quantity_lock_failure(mock_db_client, mock_redis
     assert result.success == False
     assert "lock" in result.error.lower()
     assert result.error_code == "LOCK_ACQUISITION_FAILED"
-    assert not mock_db_client.update_stock_quantity.called
 
 
 @pytest.mark.asyncio
@@ -150,3 +145,4 @@ async def test_update_inventory_quantity_input_validation():
             action="INVALID",
             quantity=50
         )
+

@@ -1,24 +1,27 @@
 """Adjust inventory for reason tool"""
 
+import re
+import uuid
 from typing import Dict, Any
 from pydantic import BaseModel, Field
 from app.tools.base import BaseTool, ToolResult
-from app.clients.database_client import DatabaseClient
 from app.clients.redis_client import RedisClient
+from app.integration.grpc_client import grpc_client
 from app.utils.validators import (
     validate_sku_code,
     validate_location_code,
     validate_quantity
 )
 from app.utils.error_handlers import handle_tool_error
-import uuid
-from datetime import datetime
+
+from app.gen.wms.inventory.v1 import inventory_pb2
+from app.gen.wms.product.v1 import product_pb2
 
 
 class AdjustInventoryForReasonInput(BaseModel):
     """Input schema for adjust_inventory_for_reason"""
-    sku_code: str = Field(..., description="SKU code")
-    location_code: str = Field(..., description="Location code")
+    sku_code: str = Field(..., description="SKU code or Product ID")
+    location_code: str = Field(..., description="Location code or Warehouse ID")
     reason: str = Field(..., description="Reason for adjustment (DAMAGED, LOST, FOUND, etc.)")
     quantity: int = Field(..., description="Quantity adjustment (can be positive or negative)")
 
@@ -27,11 +30,10 @@ class AdjustInventoryForReason(BaseTool):
     """Adjust inventory for specific reasons (stock adjustment)"""
     
     name = "adjust_inventory_for_reason"
-    description = "Adjust inventory quantity for reasons like damage, loss, or discovery after inventory count"
+    description = "Adjust inventory quantity for reasons like damage, loss, or discovery via core services"
     
     def __init__(self, config):
         super().__init__(config)
-        self.db = DatabaseClient(config)
         self.redis = RedisClient(config)
     
     def get_input_schema(self) -> Dict[str, Any]:
@@ -41,11 +43,11 @@ class AdjustInventoryForReason(BaseTool):
             "properties": {
                 "sku_code": {
                     "type": "string",
-                    "description": "SKU code"
+                    "description": "SKU code or Product ID"
                 },
                 "location_code": {
                     "type": "string",
-                    "description": "Location code"
+                    "description": "Location code or Warehouse ID"
                 },
                 "reason": {
                     "type": "string",
@@ -58,6 +60,19 @@ class AdjustInventoryForReason(BaseTool):
             },
             "required": ["sku_code", "location_code", "reason", "quantity"]
         }
+        
+    async def _resolve_product_id(self, sku_code: str) -> int:
+        """Resolve SKU code or ID to product_id"""
+        try:
+            cleaned = sku_code.upper().replace("SKU-", "")
+            return int(cleaned)
+        except ValueError:
+            async with grpc_client.product_stub() as stub:
+                response = await stub.ListProducts(product_pb2.ListProductsRequest())
+                for product in response.products:
+                    if product.name.upper() == sku_code.upper():
+                        return product.product_id
+            raise ValueError(f"Product/SKU '{sku_code}' could not be resolved to a product ID")
     
     async def execute(self, **kwargs) -> ToolResult:
         """Execute the tool"""
@@ -79,8 +94,7 @@ class AdjustInventoryForReason(BaseTool):
                     error_code="INVALID_REASON"
                 )
             
-            # Connect to services
-            await self.db.connect()
+            # Connect to Redis
             await self.redis.connect()
             
             # Acquire distributed lock
@@ -95,50 +109,41 @@ class AdjustInventoryForReason(BaseTool):
                     error_code="LOCK_ACQUISITION_FAILED"
                 )
             
-            # Perform adjustment in transaction with audit record
-            queries = [
-                {
-                    "query": """
-                        UPDATE inventory_stock
-                        SET 
-                            physical_qty = physical_qty + $1,
-                            available_qty = available_qty + $1,
-                            last_updated = NOW()
-                        WHERE sku_code = $2 AND location_code = $3
-                    """,
-                    "params": [input_data.quantity, input_data.sku_code, input_data.location_code]
-                },
-                {
-                    "query": """
-                        INSERT INTO stock_movements (
-                            sku_code, from_location, to_location, quantity, 
-                            movement_type, reason, reference_id, created_at, created_by
-                        ) VALUES ($1, $2, $3, $4, 'ADJUSTMENT', $5, $6, NOW(), 'SYSTEM')
-                    """,
-                    "params": [
-                        input_data.sku_code,
-                        input_data.location_code,
-                        input_data.location_code,
-                        input_data.quantity,
-                        input_data.reason,
-                        f"ADJ-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
-                    ]
-                }
-            ]
+            # Resolve IDs
+            product_id = await self._resolve_product_id(input_data.sku_code)
             
-            success = await self.db.execute_transaction(queries)
+            warehouse_id = 1
+            digits = re.findall(r'\d+', input_data.location_code)
+            if digits:
+                warehouse_id = int(digits[0])
+                
+            # Determine direct transaction type based on sign of quantity
+            tx_type = "ADJUSTMENT_IN" if input_data.quantity > 0 else "ADJUSTMENT_OUT"
+            abs_qty = abs(input_data.quantity)
+            
+            # Call WMS Core inventory-service ConfirmInventoryTransaction gRPC
+            async with grpc_client.inventory_stub() as stub:
+                request = inventory_pb2.ConfirmInventoryTransactionRequest(
+                    transaction_type=tx_type,
+                    product_id=product_id,
+                    warehouse_id=warehouse_id,
+                    quantity=abs_qty,
+                    user_id="mcp-agent",
+                    idempotency_key=f"confirm_adj_{uuid.uuid4().hex[:12]}"
+                )
+                response = await stub.ConfirmInventoryTransaction(request)
+                success = response.success
             
             # Release lock
             await self.redis.release_lock(lock_key, lock_value)
             
-            # Close connections
-            await self.db.disconnect()
+            # Close connection
             await self.redis.disconnect()
             
             if not success:
                 return ToolResult(
                     success=False,
-                    error="Failed to complete inventory adjustment",
+                    error="Failed to complete inventory adjustment via WMS Core service",
                     error_code="ADJUSTMENT_FAILED"
                 )
             
@@ -149,10 +154,13 @@ class AdjustInventoryForReason(BaseTool):
                 success=True,
                 data={
                     "sku_code": input_data.sku_code,
+                    "product_id": product_id,
+                    "warehouse_id": warehouse_id,
                     "location_code": input_data.location_code,
                     "reason": input_data.reason,
                     "quantity": input_data.quantity,
-                    "message": f"Successfully adjusted inventory by {input_data.quantity} for reason: {input_data.reason}"
+                    "transaction_id": response.transaction_id,
+                    "message": f"Successfully adjusted inventory by {input_data.quantity} for reason: {input_data.reason} via Core gRPC service"
                 }
             )
             
@@ -164,3 +172,4 @@ class AdjustInventoryForReason(BaseTool):
                 except:
                     pass
             return handle_tool_error(e, self.name)
+

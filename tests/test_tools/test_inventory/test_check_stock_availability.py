@@ -1,20 +1,17 @@
 """Unit tests for check_stock_availability tool"""
 
 import pytest
+from unittest.mock import AsyncMock
 from app.tools.inventory.check_stock_availability import CheckStockAvailability, CheckStockAvailabilityInput
 from app.tools.base import ToolResult
 from app.tools.base import ToolError
 
 
 @pytest.mark.asyncio
-async def test_check_stock_availability_success(mock_db_client, test_config, sample_stock_data):
+async def test_check_stock_availability_success(mock_grpc_client, test_config):
     """Test successful stock availability check"""
-    # Setup mock
-    mock_db_client.fetch_one.return_value = sample_stock_data
-    
     # Create tool instance
     tool = CheckStockAvailability(test_config)
-    tool.db = mock_db_client
     
     # Execute tool
     result = await tool.execute(sku_code="SKU-TEST-001", warehouse_id=1)
@@ -23,18 +20,18 @@ async def test_check_stock_availability_success(mock_db_client, test_config, sam
     assert result.success == True
     assert result.data["sku_code"] == "SKU-TEST-001"
     assert result.data["available_qty"] == 80
-    assert mock_db_client.fetch_one.called
+    assert mock_grpc_client.mock_inventory.GetAvailability.called
 
 
 @pytest.mark.asyncio
-async def test_check_stock_availability_not_found(mock_db_client, test_config):
+async def test_check_stock_availability_not_found(mock_grpc_client, test_config):
     """Test stock availability check when SKU not found"""
-    # Setup mock
-    mock_db_client.fetch_one.return_value = None
+    # Setup mock to return empty products list so SKU is not found
+    from app.gen.wms.product.v1 import product_pb2
+    mock_grpc_client.mock_product.ListProducts.return_value = product_pb2.ListProductsResponse()
     
     # Create tool instance
     tool = CheckStockAvailability(test_config)
-    tool.db = mock_db_client
     
     # Execute tool
     result = await tool.execute(sku_code="SKU-NOT-FOUND")
@@ -108,14 +105,13 @@ async def test_check_stock_availability_get_input_schema(test_config):
 
 
 @pytest.mark.asyncio
-async def test_check_stock_availability_database_error(mock_db_client, test_config):
+async def test_check_stock_availability_database_error(mock_grpc_client, test_config):
     """Test handling of database errors"""
-    # Setup mock to raise exception
-    mock_db_client.fetch_one.side_effect = Exception("Database connection failed")
+    # Setup mock to raise exception on gRPC call
+    mock_grpc_client.mock_inventory.GetAvailability.side_effect = Exception("Database connection failed")
     
     # Create tool instance
     tool = CheckStockAvailability(test_config)
-    tool.db = mock_db_client
     
     # Execute tool
     result = await tool.execute(sku_code="SKU-TEST-001")
@@ -123,3 +119,4 @@ async def test_check_stock_availability_database_error(mock_db_client, test_conf
     # Assertions
     assert result.success == False
     assert "Database connection failed" in result.error
+
