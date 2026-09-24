@@ -64,17 +64,9 @@ class UpdateInventoryQuantity(BaseTool):
         }
         
     async def _resolve_product_id(self, sku_code: str) -> int:
-        """Resolve SKU code or ID to product_id"""
-        try:
-            cleaned = sku_code.upper().replace("SKU-", "")
-            return int(cleaned)
-        except ValueError:
-            async with grpc_client.product_stub() as stub:
-                response = await stub.ListProducts(product_pb2.ListProductsRequest())
-                for product in response.products:
-                    if product.name.upper() == sku_code.upper():
-                        return product.product_id
-            raise ValueError(f"Product/SKU '{sku_code}' could not be resolved to a product ID")
+        """Resolve SKU code or ID to product_id via grpc_core_client with cache"""
+        from app.clients.grpc_core_client import grpc_core_client
+        return await grpc_core_client.resolve_product_id(sku_code)
 
     async def execute(self, **kwargs) -> ToolResult:
         """Execute the tool"""

@@ -1,10 +1,11 @@
 """Unit tests for Smart Slotting Optimizer & ABC Velocity (TASK-047 / ALG-03)"""
 
 import pytest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 from app.tools.inventory.smart_slotting_optimizer import SmartSlottingOptimizer
 from app.tools.inventory.abc_analysis_report import ABCAnalysisReport
 from app.tools.base import ToolResult
+from app.clients.grpc_core_client import GrpcCoreClient, UpstreamServiceUnavailableError
 
 
 @pytest.mark.asyncio
@@ -275,3 +276,100 @@ async def test_grpc_client_abc_velocity_pareto_calculation(test_config):
     res_unsold = await client.get_abc_classification("SKU-4")
     assert res_unsold["abc_class"] == "C"
     assert res_unsold["outbound_volume"] == 0
+
+
+@pytest.mark.asyncio
+async def test_get_shelf_capacity_reads_real_position_capacity(test_config):
+    """
+    Acceptance Criteria (TASK-056 / CRIT-02):
+    get_shelf_capacity() đọc max_volume_cbm và max_weight_kg thực tế từ phản hồi của PositionResponse.
+    """
+    client = GrpcCoreClient(test_config)
+
+    class MockPosition:
+        id = 100
+        code = "LOC-REAL-CAP-01"
+        zone = "ZONE-A"
+        aisle = "AISLE-01"
+        bay = "BAY-01"
+        level = "1"
+        max_weight_kg = 850.0
+        max_volume_cbm = 2.4  # 2.4 m^3 -> 2,400,000 cm^3
+
+    mock_warehouse_stub = AsyncMock()
+    mock_warehouse_stub.GetPosition = AsyncMock(return_value=MockPosition())
+
+    mock_inventory_stub = AsyncMock()
+    mock_inv_res = MagicMock()
+    mock_inv_res.locations = []
+    mock_inventory_stub.GetInventoryLocations = AsyncMock(return_value=mock_inv_res)
+
+    class MockWarehouseCM:
+        async def __aenter__(self):
+            return mock_warehouse_stub
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    class MockInventoryCM:
+        async def __aenter__(self):
+            return mock_inventory_stub
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    client._client.warehouse_stub = MagicMock(return_value=MockWarehouseCM())
+    client._client.inventory_stub = MagicMock(return_value=MockInventoryCM())
+
+    cap = await client.get_shelf_capacity("LOC-REAL-CAP-01")
+
+    assert cap["max_weight"] == 850.0
+    assert cap["max_volume"] == 2_400_000.0
+    assert cap["available_weight"] == 850.0
+    assert cap["available_volume"] == 2_400_000.0
+
+
+@pytest.mark.asyncio
+async def test_get_shelf_capacity_raises_upstream_unavailable_on_grpc_error(test_config):
+    """
+    Acceptance Criteria (TASK-056 / CRIT-02 & CRIT-04):
+    Xóa bỏ hoàn toàn khối regex và dictionary fallback trả về available_volume: 50000.0.
+    Khi gRPC thất bại: Ném UpstreamServiceUnavailableError.
+    """
+    client = GrpcCoreClient(test_config)
+
+    mock_warehouse_stub = AsyncMock()
+    mock_warehouse_stub.GetPosition = AsyncMock(side_effect=Exception("Connection refused by Core"))
+
+    class MockWarehouseCM:
+        async def __aenter__(self):
+            return mock_warehouse_stub
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    client._client.warehouse_stub = MagicMock(return_value=MockWarehouseCM())
+
+    with pytest.raises(UpstreamServiceUnavailableError) as exc_info:
+        await client.get_shelf_capacity("ZONE-A-ROW-01-LEVEL-1")
+
+    assert "WMS Core Warehouse/Inventory Service unavailable" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_smart_slotting_optimizer_handles_upstream_unavailable_error(mock_db_client, test_config):
+    """
+    Acceptance Criteria (TASK-056 / CRIT-04):
+    Công cụ smart_slotting_optimizer bắt UpstreamServiceUnavailableError và trả về
+    ToolResult(success=False, error_code="UPSTREAM_UNAVAILABLE"), không thực hiện bất kỳ gợi ý
+    xếp hàng nào khi thiếu dữ liệu sức chứa chính xác.
+    """
+    mock_db_client._grpc_client.get_product = AsyncMock(
+        side_effect=UpstreamServiceUnavailableError("Core Product Service is down")
+    )
+
+    tool = SmartSlottingOptimizer(test_config)
+    tool.db = mock_db_client
+
+    result = await tool.execute(sku_code="SKU-DOWN", quantity=5)
+
+    assert result.success is False
+    assert result.error_code == "UPSTREAM_UNAVAILABLE"
+    assert "Upstream service unavailable" in result.error

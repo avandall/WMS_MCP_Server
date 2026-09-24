@@ -11,10 +11,6 @@ from app.gen.wms.inventory.v1 import inventory_pb2
 from app.gen.wms.documents.v1 import documents_pb2
 from app.gen.wms.product.v1 import product_pb2
 from app.gen.wms.warehouse.v1 import warehouse_pb2
-from app.gen.wms.customer.v1 import customer_pb2
-from app.gen.wms.identity.v1 import identity_pb2
-from app.gen.wms.reporting.v1 import reporting_pb2
-from app.gen.wms.audit.v1 import audit_pb2
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +21,7 @@ class GrpcCoreClient:
     def __init__(self, config: Config):
         self.config = config
         self._client = grpc_client
+        self._sku_cache: Dict[str, int] = {}
         
     async def connect(self) -> None:
         """Lifecycle connect handler (no-op as grpc channels are managed lazily)"""
@@ -34,11 +31,66 @@ class GrpcCoreClient:
         """Close cached gRPC channels"""
         await self._client.close_all()
         logger.info("GrpcCoreClient disconnected")
-        
+
+    async def resolve_product_id(self, sku_or_id: str | int) -> int:
+        """
+        Resolve SKU code or Product ID string to integer product_id.
+        Lookup order:
+        1. Pure integer / digit string -> int(sku_or_id)
+        2. In-memory local cache -> cached product_id
+        3. Standard 'SKU-<digits>' format -> int(digits)
+        4. gRPC product-service ListProducts lookup matching product name/sku
+        """
+        raw_str = str(sku_or_id).strip()
+        if raw_str.isdigit():
+            return int(raw_str)
+
+        sku_upper = raw_str.upper()
+        if sku_upper in self._sku_cache:
+            return self._sku_cache[sku_upper]
+
+        # Check if it is standard numeric SKU prefix e.g. SKU-123
+        if sku_upper.startswith("SKU-"):
+            suffix = sku_upper[4:]
+            if suffix.isdigit():
+                pid = int(suffix)
+                self._sku_cache[sku_upper] = pid
+                return pid
+
+        # Query Product Service via gRPC ListProducts
+        try:
+            async with self._client.product_stub() as stub:
+                req = product_pb2.ListProductsRequest()
+                res = await stub.ListProducts(req)
+                for prod in res.products:
+                    p_name = (prod.name or "").strip().upper()
+                    p_id = prod.product_id
+                    # Cache both exact name and SKU-prefixed form
+                    self._sku_cache[p_name] = p_id
+                    self._sku_cache[f"SKU-{p_id}"] = p_id
+                    if p_name == sku_upper or f"SKU-{p_id}" == sku_upper:
+                        return p_id
+
+                # Second pass: check if sku_upper without "SKU-" matches product name
+                cleaned = sku_upper.replace("SKU-", "").strip()
+                if cleaned in self._sku_cache:
+                    return self._sku_cache[cleaned]
+
+        except UpstreamServiceUnavailableError:
+            raise
+        except Exception as e:
+            logger.error(f"Error querying product service to resolve SKU '{raw_str}': {e}")
+            raise UpstreamServiceUnavailableError(f"WMS Core Product Service unavailable: {e}") from e
+
+        if sku_upper in self._sku_cache:
+            return self._sku_cache[sku_upper]
+
+        raise ValueError(f"Product/SKU '{raw_str}' could not be resolved to a valid product ID")
+
     async def get_stock_info(self, sku_or_id: str | int, warehouse_id: int = 1) -> Optional[Dict[str, Any]]:
         """Get stock availability for product in warehouse via inventory gRPC service"""
         try:
-            prod_id = int(sku_or_id) if str(sku_or_id).isdigit() else 1
+            prod_id = await self.resolve_product_id(sku_or_id)
             async with self._client.inventory_stub() as stub:
                 req = inventory_pb2.GetAvailabilityRequest(product_id=prod_id, warehouse_id=warehouse_id)
                 res = await stub.GetAvailability(req)
@@ -52,6 +104,8 @@ class GrpcCoreClient:
                     "location_code": f"ZONE-A-SHELF-{res.warehouse_id}",
                     "last_updated": "2026-09-20T00:00:00Z"
                 }
+        except ValueError:
+            raise
         except Exception as e:
             logger.error(f"Error calling GetAvailability gRPC: {e}")
             raise UpstreamServiceUnavailableError(f"WMS Core Inventory Service unavailable: {e}") from e
@@ -59,7 +113,7 @@ class GrpcCoreClient:
     async def get_inventory_locations(
         self, warehouse_id: int = 1, product_id: Optional[int] = None
     ) -> List[Dict[str, Any]]:
-        """Get inventory location rows via inventory-service gRPC"""
+        """Get inventory location rows via inventory-service gRPC with real spatial coordinates"""
         try:
             async with self._client.inventory_stub() as stub:
                 req = inventory_pb2.GetInventoryLocationsRequest(
@@ -80,13 +134,16 @@ class GrpcCoreClient:
                         "available_qty": loc.available_qty,
                         "status": loc.status,
                         "lot_number": loc.lot_number,
-                        "location_code": f"ZONE-A-POS-{loc.position_id or 1}",
-                        "x_coordinate": float(loc.position_id * 2 % 50),
-                        "y_coordinate": float(loc.position_id * 3 % 50),
-                        "z_coordinate": float(loc.position_id % 5),
-                        "zone_id": "ZONE-A",
-                        "row_id": f"ROW-{(loc.position_id or 1) % 10 + 1}",
-                        "shelf_id": f"SHELF-{(loc.position_id or 1) % 5 + 1}"
+                        "location_code": loc.location_code or f"ZONE-A-POS-{loc.position_id or 1}",
+                        "x_coordinate": float(loc.x_coordinate),
+                        "y_coordinate": float(loc.y_coordinate),
+                        "z_coordinate": float(loc.z_coordinate),
+                        "zone_id": loc.zone_id or "ZONE-A",
+                        "row_id": loc.aisle or "ROW-01",
+                        "shelf_id": loc.bay or "SHELF-01",
+                        "aisle": loc.aisle or "AISLE-01",
+                        "bay": loc.bay or "BAY-01",
+                        "level": loc.level or "1",
                     })
                 return locations
         except Exception as e:
@@ -158,10 +215,18 @@ class GrpcCoreClient:
             async with self._client.warehouse_stub() as stub:
                 req = warehouse_pb2.GetPositionRequest(warehouse_id=warehouse_id, code=location_code)
                 pos = await stub.GetPosition(req)
-                
+
+                if not pos or not pos.id:
+                    raise UpstreamServiceUnavailableError(
+                        f"Position '{location_code}' not found in Warehouse {warehouse_id}"
+                    )
+
                 max_weight = float(pos.max_weight_kg) if pos.max_weight_kg else 500.0
-                max_vol = 50000.0
-                
+                if getattr(pos, "max_volume_cbm", None):
+                    max_vol = float(pos.max_volume_cbm) * 1_000_000.0 if pos.max_volume_cbm < 500.0 else float(pos.max_volume_cbm)
+                else:
+                    max_vol = 50000.0
+
                 current_weight = 0.0
                 current_volume = 0.0
                 async with self._client.inventory_stub() as inv_stub:
@@ -176,10 +241,10 @@ class GrpcCoreClient:
                         p_vol = (prod.get("length", 10.0) * prod.get("width", 10.0) * prod.get("height", 10.0)) if prod else 1000.0
                         current_weight += item.quantity * p_weight
                         current_volume += item.quantity * p_vol
-                
+
                 avail_weight = max(0.0, max_weight - current_weight)
                 avail_volume = max(0.0, max_vol - current_volume)
-                
+
                 return {
                     "location_code": pos.code or location_code,
                     "zone_id": pos.zone or "ZONE-A",
@@ -193,31 +258,11 @@ class GrpcCoreClient:
                     "available_volume": round(avail_volume, 2),
                     "available_weight": round(avail_weight, 2)
                 }
+        except UpstreamServiceUnavailableError:
+            raise
         except Exception as e:
-            logger.warning(f"Could not retrieve live capacity via gRPC: {e}")
-            import re
-            zone = "ZONE-A"
-            if "ZONE-" in location_code:
-                match = re.search(r"ZONE-([A-Z])", location_code)
-                if match:
-                    zone = f"ZONE-{match.group(1)}"
-            level = "1"
-            level_match = re.search(r"(?:LEVEL|SHELF|L)-?(\d+)", location_code, re.IGNORECASE)
-            if level_match:
-                level = level_match.group(1)
-            return {
-                "location_code": location_code,
-                "zone_id": zone,
-                "row_id": "ROW-01",
-                "shelf_id": f"SHELF-{level}",
-                "level": level,
-                "max_volume": 50000.0,
-                "max_weight": 500.0,
-                "current_volume": 0.0,
-                "current_weight": 0.0,
-                "available_volume": 50000.0,
-                "available_weight": 500.0
-            }
+            logger.error(f"Error calling GetPosition/GetInventoryLocations gRPC: {e}")
+            raise UpstreamServiceUnavailableError(f"WMS Core Warehouse/Inventory Service unavailable: {e}") from e
 
     async def get_abc_classification(self, sku_code: str, warehouse_id: int = 1) -> Optional[Dict[str, Any]]:
         """
@@ -242,9 +287,10 @@ class GrpcCoreClient:
                         pick_counts[pid] = pick_counts.get(pid, 0) + 1
                         outbound_volumes[pid] = outbound_volumes.get(pid, 0) + qty
                 
-                import re
-                digits = re.findall(r"\d+", str(sku_code))
-                target_pid = int(digits[0]) if digits else 1
+                try:
+                    target_pid = await self.resolve_product_id(sku_code)
+                except Exception:
+                    target_pid = 1
                 
                 target_picks = pick_counts.get(target_pid, 0)
                 target_volume = outbound_volumes.get(target_pid, 0)
@@ -258,7 +304,7 @@ class GrpcCoreClient:
                     for pid, vol in sorted_by_vol:
                         running_sum += vol
                         cum_ratio = running_sum / total_outbound if total_outbound > 0 else 0
-                        if cum_ratio <= 0.80:
+                        if not abc_map or cum_ratio <= 0.80:
                             abc_map[pid] = "A"
                         elif cum_ratio <= 0.95:
                             abc_map[pid] = "B"
@@ -319,6 +365,7 @@ class GrpcCoreClient:
     async def get_low_stock_items(self, threshold_qty: Optional[int] = None) -> List[Dict[str, Any]]:
         """Get items with low stock via reporting-service gRPC"""
         try:
+            from app.gen.wms.reporting.v1 import reporting_pb2
             async with self._client.reporting_stub() as stub:
                 req = reporting_pb2.InventoryReportRequest(low_stock_threshold=threshold_qty or 10)
                 res = await stub.InventoryReport(req)

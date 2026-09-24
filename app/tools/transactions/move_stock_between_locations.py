@@ -133,33 +133,41 @@ class MoveStockBetweenLocations(BaseTool):
                     error_code="INSUFFICIENT_STOCK"
                 )
             
-            # Perform transfer in transaction
-            queries = [
-                {
-                    "query": """
-                        UPDATE inventory_stock
-                        SET 
-                            physical_qty = physical_qty - $1,
-                            available_qty = available_qty - $1,
-                            last_updated = NOW()
-                        WHERE sku_code = $2 AND location_code = $3
-                    """,
-                    "params": [input_data.quantity, input_data.sku_code, input_data.from_location]
-                },
-                {
-                    "query": """
-                        UPDATE inventory_stock
-                        SET 
-                            physical_qty = physical_qty + $1,
-                            available_qty = available_qty + $1,
-                            last_updated = NOW()
-                        WHERE sku_code = $2 AND location_code = $3
-                    """,
-                    "params": [input_data.quantity, input_data.sku_code, input_data.to_location]
-                }
-            ]
-            
-            success = await self.db.execute_transaction(queries)
+            # Perform transfer using type-safe domain method (TASK-060)
+            if hasattr(self.db, "move_inventory_stock"):
+                success = await self.db.move_inventory_stock(
+                    sku_code=input_data.sku_code,
+                    quantity=input_data.quantity,
+                    from_location=input_data.from_location,
+                    to_location=input_data.to_location
+                )
+            else:
+                # Fallback compatibility for test mocks only implementing execute_transaction
+                queries = [
+                    {
+                        "query": """
+                            UPDATE inventory_stock
+                            SET 
+                                physical_qty = physical_qty - $1,
+                                available_qty = available_qty - $1,
+                                last_updated = NOW()
+                            WHERE sku_code = $2 AND location_code = $3
+                        """,
+                        "params": [input_data.quantity, input_data.sku_code, input_data.from_location]
+                    },
+                    {
+                        "query": """
+                            UPDATE inventory_stock
+                            SET 
+                                physical_qty = physical_qty + $1,
+                                available_qty = available_qty + $1,
+                                last_updated = NOW()
+                            WHERE sku_code = $2 AND location_code = $3
+                        """,
+                        "params": [input_data.quantity, input_data.sku_code, input_data.to_location]
+                    }
+                ]
+                success = await self.db.execute_transaction(queries)
             
             # Release locks with exact token (TECH-BUG-02)
             await self.redis.release_multiple_locks(keys_to_lock, lock_value)

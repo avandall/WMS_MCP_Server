@@ -1,8 +1,11 @@
 """Unit tests for 3D-BPP Geometric Packing & Hazmat Segregation (TASK-045 / ALG-01)"""
 
 import pytest
-from app.tools.orders.suggest_packing_box import SuggestPackingBox
-from app.tools.base import ToolResult
+
+from app.tools.orders.suggest_packing_box import (
+    SuggestPackingBox,
+    _has_sufficient_base_support,
+)
 
 
 @pytest.mark.asyncio
@@ -340,3 +343,159 @@ async def test_dimensional_weight_billable_optimization(mock_db_client, test_con
     
     # Box S must be chosen first because of lower billable shipping weight
     assert recs[0]["box_id"] == "BOX-S"
+
+
+def test_base_support_gravity_constraint_unit():
+    """
+    Acceptance Criteria (TASK-062):
+    1. If pz == 0: perfectly supported by the carton bottom (True).
+    2. If pz > 0 and base support ratio >= 70%: True.
+    3. If pz > 0 and base support ratio < 70%: False (floating / hanging item rejected).
+    """
+    item = {"sku_code": "SKU-TEST-01", "weight": 1.0}
+
+    # 1. On bottom (pz = 0) -> always valid
+    assert _has_sufficient_base_support(item, (0, 0, 0, 20, 20, 10), [], min_ratio=0.70) is True
+
+    # 2. Supported by box below (100% support)
+    placed_100 = [(0, 0, 0, 20, 20, 10, {"sku_code": "SKU-BASE", "is_fragile": False})]
+    assert _has_sufficient_base_support(item, (0, 0, 10, 20, 20, 10), placed_100, min_ratio=0.70) is True
+
+    # 3. Supported by box below (75% support >= 70%)
+    # Base box: 20 x 15 -> area 300; candidate item: 20 x 20 -> area 400; ratio = 300/400 = 75%
+    placed_75 = [(0, 0, 0, 20, 15, 10, {"sku_code": "SKU-BASE", "is_fragile": False})]
+    assert _has_sufficient_base_support(item, (0, 0, 10, 20, 20, 10), placed_75, min_ratio=0.70) is True
+
+    # 4. Under-supported by box below (50% support < 70%) -> REJECTED
+    # Base box: 20 x 10 -> area 200; candidate item: 20 x 20 -> area 400; ratio = 50%
+    placed_50 = [(0, 0, 0, 20, 10, 10, {"sku_code": "SKU-BASE", "is_fragile": False})]
+    assert _has_sufficient_base_support(item, (0, 0, 10, 20, 20, 10), placed_50, min_ratio=0.70) is False
+
+    # 5. Gap / floating in air (placed box top at z=8, item placed at z=10) -> REJECTED
+    placed_gap = [(0, 0, 0, 20, 20, 8, {"sku_code": "SKU-BASE", "is_fragile": False})]
+    assert _has_sufficient_base_support(item, (0, 0, 10, 20, 20, 10), placed_gap, min_ratio=0.70) is False
+
+
+def test_fragile_constraint_heavy_item_rejected_unit():
+    """
+    Acceptance Criteria (TASK-062):
+    Tuyệt đối không xếp kiện hàng có trọng lượng > 2.0kg đè lên kiện hàng có thuộc tính is_fragile=True.
+    """
+    fragile_base = [(0, 0, 0, 20, 20, 10, {"sku_code": "SKU-GLASS", "is_fragile": True})]
+    non_fragile_base = [(0, 0, 0, 20, 20, 10, {"sku_code": "SKU-WOOD", "is_fragile": False})]
+
+    # 1. Heavy item (weight = 2.5kg > 2.0kg) placed on fragile item -> REJECTED
+    heavy_item = {"sku_code": "SKU-HEAVY", "weight": 2.5}
+    assert _has_sufficient_base_support(heavy_item, (0, 0, 10, 20, 20, 10), fragile_base) is False
+
+    # 2. Borderline heavy item (weight = 5.0kg) placed on fragile item -> REJECTED
+    very_heavy_item = {"sku_code": "SKU-ANVIL", "weight": 5.0}
+    assert _has_sufficient_base_support(very_heavy_item, (0, 0, 10, 20, 20, 10), fragile_base) is False
+
+    # 3. Light item (weight = 1.2kg <= 2.0kg) placed on fragile item -> ALLOWED
+    light_item = {"sku_code": "SKU-LIGHT", "weight": 1.2}
+    assert _has_sufficient_base_support(light_item, (0, 0, 10, 20, 20, 10), fragile_base) is True
+
+    # 4. Heavy item (weight = 15.0kg) placed on non-fragile item -> ALLOWED
+    assert _has_sufficient_base_support(very_heavy_item, (0, 0, 10, 20, 20, 10), non_fragile_base) is True
+
+
+@pytest.mark.asyncio
+async def test_oversized_item_error_result(mock_db_client, test_config):
+    """
+    Acceptance Criteria (TASK-062 / MED-10):
+    Nếu không có bất kỳ thùng carton nào chứa vừa sản phẩm:
+    Trả về ToolResult(success=False, error_code="OVERSIZED_ITEM",
+    error="Order contains oversized items exceeding all available carton dimensions. Palletizing / custom crate required.")
+    """
+    oversized_item = [
+        {
+            "sku_code": "SKU-GIANT-CRATE",
+            "name": "Industrial Generator",
+            "quantity": 1,
+            "length": 250.0,  # Exceeds even XXL (140cm)
+            "width": 180.0,
+            "height": 120.0,
+            "weight": 80.0,
+            "allow_rotation": True,
+            "category": "MACHINERY"
+        }
+    ]
+    
+    mock_db_client.fetch_many.side_effect = [
+        oversized_item,
+        []  # Fallback to default candidate boxes (max length 140cm)
+    ]
+    
+    tool = SuggestPackingBox(test_config)
+    tool.db = mock_db_client
+    
+    result = await tool.execute(order_id="ORD-OVERSIZED-99")
+    assert result.success is False
+    assert result.error_code == "OVERSIZED_ITEM"
+    assert "Order contains oversized items exceeding all available carton dimensions. Palletizing / custom crate required." in result.error
+    assert result.data["order_id"] == "ORD-OVERSIZED-99"
+
+
+@pytest.mark.asyncio
+async def test_3d_bpp_packing_gravity_and_fragile_integration(mock_db_client, test_config):
+    """
+    Integration test: Order contains a fragile item and a heavy item in a vertical-stack-only box.
+    Sturdy heavy item must be placed at the bottom, and fragile item on top.
+    """
+    order_items = [
+        {
+            "sku_code": "SKU-GLASSWARE",
+            "name": "Crystal Vase",
+            "quantity": 1,
+            "length": 20.0,
+            "width": 15.0,
+            "height": 10.0,
+            "weight": 1.0,
+            "allow_rotation": False,
+            "is_fragile": True,
+            "category": "FRAGILE"
+        },
+        {
+            "sku_code": "SKU-DUMBBELL",
+            "name": "Cast Iron Dumbbell",
+            "quantity": 1,
+            "length": 20.0,
+            "width": 15.0,
+            "height": 10.0,
+            "weight": 4.5,  # > 2.0kg
+            "allow_rotation": False,
+            "is_fragile": False,
+            "category": "FITNESS"
+        }
+    ]
+    
+    # Candidate box: 25 x 20 x 25.
+    # Usable dimensions with 10% dunnage: 22.5 x 18 x 22.5.
+    # Floor can only fit ONE item (20 x 15), so items MUST stack vertically (height: 10 + 10 = 20 <= 22.5).
+    candidate_boxes = [
+        {
+            "box_id": "BOX-STACK-VERTICAL",
+            "name": "Vertical Stack Box",
+            "length": 25.0,
+            "width": 20.0,
+            "height": 25.0,
+            "max_weight": 20.0,
+            "volume": 12500.0
+        }
+    ]
+    
+    mock_db_client.fetch_many.side_effect = [
+        order_items,
+        candidate_boxes
+    ]
+    
+    tool = SuggestPackingBox(test_config)
+    tool.db = mock_db_client
+    
+    result = await tool.execute(order_id="ORD-FRAGILE-STACK")
+    assert result.success is True
+    recs = result.data["recommendations"]
+    assert len(recs) == 1
+    assert recs[0]["box_id"] == "BOX-STACK-VERTICAL"
+

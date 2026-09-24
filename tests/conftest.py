@@ -47,6 +47,9 @@ async def mock_db_client(test_config: Config) -> AsyncGenerator[DatabaseClient, 
     client.execute = AsyncMock(return_value="SELECT 1")
     client.execute_transaction = AsyncMock(return_value=True)
     client.update_stock_quantity = AsyncMock(return_value=True)
+    client.confirm_inventory_adjustment = AsyncMock(return_value=True)
+    client.move_inventory_stock = AsyncMock(return_value=True)
+    client.resolve_product_id = AsyncMock(return_value=1)
     
     yield client
     

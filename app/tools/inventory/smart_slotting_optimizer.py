@@ -6,6 +6,7 @@ from typing import Dict, Any, List, Optional, Tuple
 from pydantic import BaseModel, Field
 from app.tools.base import BaseTool, ToolResult
 from app.clients.database_client import DatabaseClient
+from app.exceptions import UpstreamServiceUnavailableError
 from app.utils.validators import validate_sku_code, validate_quantity
 from app.utils.error_handlers import handle_tool_error
 
@@ -156,7 +157,22 @@ class SmartSlottingOptimizer(BaseTool):
                 }
             )
             
+        except UpstreamServiceUnavailableError as e:
+            logger.error(f"Upstream service unavailable in {self.name}: {e}")
+            try:
+                await self.db.disconnect()
+            except Exception:
+                pass
+            return ToolResult(
+                success=False,
+                error=f"Upstream service unavailable: {str(e)}",
+                error_code="UPSTREAM_UNAVAILABLE"
+            )
         except Exception as e:
+            try:
+                await self.db.disconnect()
+            except Exception:
+                pass
             return handle_tool_error(e, self.name)
             
     def _extract_level_number(self, loc: Dict[str, Any]) -> int:
