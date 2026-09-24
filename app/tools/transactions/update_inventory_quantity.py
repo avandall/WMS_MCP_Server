@@ -160,11 +160,11 @@ class UpdateInventoryQuantity(BaseTool):
             )
             
         except Exception as e:
-            # Ensure lock is released on error
-            if lock_key and hasattr(self, 'redis'):
+            # Ensure lock is released on error with exact token (TECH-BUG-02)
+            if lock_key and hasattr(self, 'redis') and 'lock_value' in locals() and lock_value:
                 try:
-                    await self.redis.release_lock(lock_key, str(uuid.uuid4()))
-                except:
+                    await self.redis.release_lock(lock_key, lock_value)
+                except Exception:
                     pass
             return handle_tool_error(e, self.name)
 

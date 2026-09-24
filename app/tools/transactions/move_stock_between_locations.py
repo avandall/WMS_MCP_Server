@@ -87,16 +87,19 @@ class MoveStockBetweenLocations(BaseTool):
             lock_key_to = f"lock:inventory:{input_data.sku_code}:{input_data.to_location}"
             lock_value = str(uuid.uuid4())
             
-            lock_from = await self.redis.acquire_lock(lock_key_from, lock_value, expire=30)
-            lock_to = await self.redis.acquire_lock(lock_key_to, lock_value, expire=30)
+            # CRITICAL FIX [TECH-BUG-01]: Lexicographical lock ordering to prevent AB-BA deadlock
+            keys_to_lock = sorted([lock_key_from, lock_key_to])
             
-            if not lock_from or not lock_to:
-                # Release any acquired locks
-                if lock_from:
-                    await self.redis.release_lock(lock_key_from, lock_value)
-                if lock_to:
-                    await self.redis.release_lock(lock_key_to, lock_value)
-                
+            # Acquire locks with deterministic ordering and retry to guarantee completion under concurrent load
+            locks_acquired = await self.redis.acquire_multiple_locks(
+                keys=keys_to_lock,
+                lock_value=lock_value,
+                expire=30,
+                timeout=10.0,
+                retry_interval=0.02
+            )
+            
+            if not locks_acquired:
                 return ToolResult(
                     success=False,
                     error="Could not acquire locks - another operation is in progress",
@@ -121,9 +124,8 @@ class MoveStockBetweenLocations(BaseTool):
                     source_location_stock = source_stock
             
             if not source_location_stock or source_location_stock.get('available_qty', 0) < input_data.quantity:
-                # Release locks
-                await self.redis.release_lock(lock_key_from, lock_value)
-                await self.redis.release_lock(lock_key_to, lock_value)
+                # Release locks with exact token
+                await self.redis.release_multiple_locks(keys_to_lock, lock_value)
                 
                 return ToolResult(
                     success=False,
@@ -159,9 +161,8 @@ class MoveStockBetweenLocations(BaseTool):
             
             success = await self.db.execute_transaction(queries)
             
-            # Release locks
-            await self.redis.release_lock(lock_key_from, lock_value)
-            await self.redis.release_lock(lock_key_to, lock_value)
+            # Release locks with exact token (TECH-BUG-02)
+            await self.redis.release_multiple_locks(keys_to_lock, lock_value)
             
             # Close connections
             await self.db.disconnect()
@@ -189,10 +190,10 @@ class MoveStockBetweenLocations(BaseTool):
             )
             
         except Exception as e:
-            # Ensure locks are released on error
-            if lock_key and hasattr(self, 'redis'):
+            # Ensure locks are released on error using the exact same lock_value (TECH-BUG-02)
+            if hasattr(self, 'redis') and 'keys_to_lock' in locals() and 'lock_value' in locals():
                 try:
-                    await self.redis.release_lock(lock_key, str(uuid.uuid4()))
-                except:
+                    await self.redis.release_multiple_locks(keys_to_lock, lock_value)
+                except Exception:
                     pass
             return handle_tool_error(e, self.name)

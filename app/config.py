@@ -2,11 +2,17 @@
 
 from typing import List, Optional
 from pydantic import Field
-from pydantic_settings import BaseSettings as PydanticBaseSettings
+from pydantic_settings import BaseSettings as PydanticBaseSettings, SettingsConfigDict
 import os
 
 
 class Config(PydanticBaseSettings):
+    model_config = SettingsConfigDict(
+        extra="ignore",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=True
+    )
     """Application configuration using environment variables"""
     
     # Application
@@ -107,11 +113,6 @@ class Config(PydanticBaseSettings):
     EVENT_BUS_URL: str = Field(default="redis://event-bus:6379/0", description="Event bus Redis URL")
     EVENT_STREAM: str = Field(default="wms.events", description="Event stream name")
     EVENTS_ENABLED: bool = Field(default=True, description="Enable event publishing")
-    
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
-        case_sensitive = True
     
     def is_tool_enabled(self, tool_name: str) -> bool:
         """

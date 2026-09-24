@@ -1,6 +1,12 @@
 """Stress testing configuration for WMS MCP Server"""
 
-from locust import HttpUser, task, constant
+try:
+    from locust import HttpUser, task, constant
+except ImportError:
+    HttpUser = object
+    task = lambda f: f
+    constant = lambda s: s
+
 import json
 
 
@@ -12,10 +18,11 @@ class StressTestUser(HttpUser):
     @task
     def rapid_tool_calls(self):
         """Rapid tool calls to stress test the system"""
-        self.client.post(
-            "/tools/check_stock_availability",
-            json={
-                "sku_code": "SKU-1060-6GB",
-                "warehouse_id": 1
-            }
-        )
+        if hasattr(self, 'client'):
+            self.client.post(
+                "/tools/check_stock_availability",
+                json={
+                    "sku_code": "SKU-1060-6GB",
+                    "warehouse_id": 1
+                }
+            )

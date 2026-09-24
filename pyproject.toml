@@ -11,6 +11,9 @@ dependencies = [
     "asyncpg>=0.29.0",
     "redis>=5.0.0",
     "aio-pika>=9.0.0",
+    "grpcio>=1.84.0",
+    "protobuf>=7.36.2",
+    "psutil>=7.2.2",
 ]
 
 [dev-dependencies]
@@ -20,4 +23,11 @@ pytest-cov = ">=4.1.0"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-testpaths = ["tests/test_tools", "tests/test_integration", "tests/test_mcp"]
+testpaths = ["tests/test_tools", "tests/test_integration", "tests/test_mcp", "tests/test_packing_box_3d.py", "tests/test_picking_route_graph.py", "tests/test_smart_slotting.py"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "pytest-cov>=7.1.0",
+]

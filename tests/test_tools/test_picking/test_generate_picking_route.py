@@ -52,7 +52,7 @@ async def test_generate_picking_route_success(mock_db_client, test_config):
     tool = GeneratePickingRoute(test_config)
     tool.db = mock_db_client
     
-    result = await tool.execute(order_id="ORD-TEST-001")
+    result = await tool.execute(order_id="ORD-TEST-001", routing_mode="euclidean")
     
     assert result.success is True
     assert result.data["order_id"] == "ORD-TEST-001"
@@ -62,7 +62,7 @@ async def test_generate_picking_route_success(mock_db_client, test_config):
     route = result.data["optimized_route"]
     assert len(route) == 3
     
-    # Distance between:
+    # Distance in euclidean legacy mode:
     # 1: (0, 0, 0) and 2: (0, 5, 0) is 5.0
     # 2: (0, 5, 0) and 3: (10, 10, 0) is sqrt(100 + 25) = 11.18
     # Total distance: 5.0 + 11.18 = 16.18
@@ -73,6 +73,13 @@ async def test_generate_picking_route_success(mock_db_client, test_config):
     assert len(instructions) == 3
     assert instructions[0]["stop_number"] == 1
     assert instructions[0]["location_code"] == "ZONE-A-ROW-01-SHELF-01"
+
+    # Also verify default modern aisle graph routing
+    mock_db_client.fetch_many.return_value = items_locations_mock
+    result_graph = await tool.execute(order_id="ORD-TEST-001")
+    assert result_graph.success is True
+    assert result_graph.data["route_metrics"]["total_distance_m"] == 120.0
+    assert "S-Shape" in result_graph.data["route_metrics"]["routing_algorithm"]
 
 
 @pytest.mark.asyncio

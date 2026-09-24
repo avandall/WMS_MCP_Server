@@ -70,6 +70,8 @@ async def mock_redis_client(test_config: Config) -> AsyncGenerator[RedisClient, 
     client.exists = AsyncMock(return_value=False)
     client.acquire_lock = AsyncMock(return_value=True)
     client.release_lock = AsyncMock(return_value=True)
+    client.acquire_multiple_locks = AsyncMock(return_value=True)
+    client.release_multiple_locks = AsyncMock(return_value=None)
     client.check_lock = AsyncMock(return_value=None)
     client.get_all_locks = AsyncMock(return_value=[])
     client.cache_get = AsyncMock(return_value=None)

@@ -35,6 +35,14 @@ def handle_tool_error(error: Exception, tool_name: str = "unknown") -> ToolResul
             error_code="VALIDATION_ERROR",
             details={"tool_name": tool_name}
         )
+    elif type(error).__name__ == "UpstreamServiceUnavailableError" or getattr(error, "__class__", None).__name__ == "UpstreamServiceUnavailableError":
+        logger.error(f"Upstream service unavailable in tool {tool_name}: {error}")
+        return ToolResult(
+            success=False,
+            error=str(error),
+            error_code="UPSTREAM_UNAVAILABLE",
+            details={"tool_name": tool_name}
+        )
     else:
         # Generic exception
         logger.error(f"Unexpected error in tool {tool_name}: {error}", exc_info=True)

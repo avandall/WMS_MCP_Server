@@ -1,5 +1,5 @@
-"""Redis client for caching and distributed locks"""
-
+import asyncio
+import time
 from typing import Optional, Any, Dict
 import logging
 import redis.asyncio as redis
@@ -206,6 +206,74 @@ class RedisClient:
             lock_value
         )
         return result == 1
+    
+    async def acquire_multiple_locks(
+        self,
+        keys: list[str],
+        lock_value: str,
+        expire: int = 30,
+        timeout: float = 10.0,
+        retry_interval: float = 0.02,
+    ) -> bool:
+        """
+        Acquire multiple distributed locks in deterministic lexicographical order
+        to eliminate AB-BA Deadlocks (TASK-049 / TECH-BUG-01).
+        
+        Args:
+            keys: List of lock keys to acquire
+            lock_value: Unique owner token for lock management
+            expire: TTL in seconds for each lock
+            timeout: Maximum seconds to wait before giving up
+            retry_interval: Seconds to wait between lock retry attempts
+            
+        Returns:
+            bool: True if ALL locks are successfully acquired; False on timeout.
+        """
+        if not self._client:
+            await self.connect()
+
+        sorted_keys = sorted(list(set(keys)))
+        start_time = time.monotonic()
+
+        while (time.monotonic() - start_time) < timeout:
+            acquired: list[str] = []
+            all_ok = True
+            for key in sorted_keys:
+                ok = await self.acquire_lock(key, lock_value, expire=expire)
+                if ok:
+                    acquired.append(key)
+                else:
+                    all_ok = False
+                    break
+
+            if all_ok:
+                return True
+
+            # If any lock in the chain fails, release all previously acquired locks in this attempt
+            for key in acquired:
+                await self.release_lock(key, lock_value)
+            acquired.clear()
+
+            await asyncio.sleep(retry_interval)
+
+        return False
+
+    async def release_multiple_locks(self, keys: list[str], lock_value: str) -> None:
+        """
+        Release multiple distributed locks using the exact owner token.
+        
+        Args:
+            keys: List of lock keys to release
+            lock_value: The unique lock value passed during acquisition
+        """
+        if not self._client:
+            await self.connect()
+
+        for key in keys:
+            try:
+                await self.release_lock(key, lock_value)
+            except Exception as e:
+                logger.error(f"Error releasing lock {key}: {e}")
     
     async def check_lock(self, lock_key: str) -> Optional[Dict[str, Any]]:
         """
