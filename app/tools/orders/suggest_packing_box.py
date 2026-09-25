@@ -121,6 +121,8 @@ class SuggestPackingBox(BaseTool):
                 cat = it.get("category", "GENERAL")
                 name = it.get("name", "")
                 is_frag = bool(it.get("is_fragile", False) or "FRAGILE" in str(cat).upper())
+                is_liq = bool(it.get("is_liquid", False) or "LIQUID" in str(cat).upper() or "BEVERAGE" in str(cat).upper() or "OIL" in str(cat).upper() or "CHEMICAL" in str(cat).upper() or "LIQUID" in str(name).upper())
+                is_elec = bool(it.get("is_electronic", False) or "ELECTRONIC" in str(cat).upper() or "DEVICE" in str(cat).upper())
                 case_sz = int(it.get("case_size", 1))
                 uoms_list = it.get("uoms", [])
                 
@@ -136,6 +138,8 @@ class SuggestPackingBox(BaseTool):
                     "hazmat_class": hazmat,
                     "category": cat,
                     "is_fragile": is_frag,
+                    "is_liquid": is_liq,
+                    "is_electronic": is_elec,
                     "case_size": case_sz,
                     "uoms": uoms_list,
                     "item_volume": l * w * h,
@@ -407,13 +411,14 @@ class SuggestPackingBox(BaseTool):
         placed_boxes: list[Any],
         min_ratio: float = 0.70
     ) -> bool:
-        """Check base support ratio and fragile item stacking constraints.
+        """Check base support ratio, zero-load on fragile, and liquid isolation (TASK-062 / TASK-086 / DOM-05).
 
-        Acceptance Criteria (TASK-062):
+        Acceptance Criteria:
         1. If pz == 0: perfectly supported by the carton bottom -> True.
         2. If pz > 0: must have at least 70% (min_ratio) of base area (dx * dy)
            supported by the top surfaces (z' + dz' == pz) of placed boxes below.
-        3. Never place an item with weight > 2.0kg on top of any placed box with is_fragile=True.
+        3. Zero-Load on Fragile (TASK-086): Never place any item on top of any placed box marked is_fragile=True.
+        4. Liquid Isolation (TASK-086): Never place a liquid item (is_liquid=True) on top of electronics or dry goods.
         """
         return _has_sufficient_base_support(item, placement, placed_boxes, min_ratio=min_ratio)
 
@@ -446,14 +451,23 @@ class SuggestPackingBox(BaseTool):
         expanded_items: list[dict[str, Any]] = []
         for it in items:
             qty = max(1, int(it.get("quantity", 1)))
+            cat = str(it.get("category", "")).upper()
+            name = str(it.get("name", "")).upper()
+            is_frag = bool(it.get("is_fragile", False) or "FRAGILE" in cat)
+            is_liq = bool(it.get("is_liquid", False) or "LIQUID" in cat or "BEVERAGE" in cat or "OIL" in cat or "CHEMICAL" in cat or "LIQUID" in name)
+            is_elec = bool(it.get("is_electronic", False) or "ELECTRONIC" in cat or "DEVICE" in cat)
             for _ in range(qty):
                 expanded_items.append({
                     "sku_code": it.get("sku_code"),
+                    "name": it.get("name", ""),
                     "length": float(it.get("length", 0.0)),
                     "width": float(it.get("width", 0.0)),
                     "height": float(it.get("height", 0.0)),
                     "weight": float(it.get("weight", 0.0)),
-                    "is_fragile": bool(it.get("is_fragile", False)),
+                    "is_fragile": is_frag,
+                    "is_liquid": is_liq,
+                    "is_electronic": is_elec,
+                    "category": it.get("category", "GENERAL"),
                     "allow_rotation": bool(it.get("allow_rotation", True)),
                     "volume": float(it.get("length", 0.0)) * float(it.get("width", 0.0)) * float(it.get("height", 0.0))
                 })
@@ -559,14 +573,16 @@ def _has_sufficient_base_support(
     placed_boxes: list[Any],
     min_ratio: float = 0.70
 ) -> bool:
-    """Check base support ratio and fragile item stacking constraints (TASK-062).
+    """Check base support ratio, zero-load on fragile, and liquid isolation (TASK-062 / TASK-086 / DOM-05).
 
     1. Base Support & Gravity:
        - If pz <= 0: resting on carton bottom -> 100% support (True).
        - If pz > 0: must have at least min_ratio (70%) of base area (dx * dy)
          supported by top surfaces (z' + dz' == pz) of placed boxes below.
-    2. Fragile Item Protection:
-       - Never place an item with weight > 2.0kg on top of any placed box marked is_fragile=True.
+    2. Zero-Load on Fragile (TASK-086 / DOM-05):
+       - Tuyệt đối cấm đặt bất kỳ kiện hàng nào đè lên kiện hàng có cờ is_fragile=True (xóa bỏ hoàn toàn ngưỡng 2kg).
+    3. Liquid Isolation (TASK-086 / DOM-05):
+       - Sản phẩm dạng lỏng (is_liquid=True) không được đặt bên trên sản phẩm điện tử / hàng khô (pz > 0).
     """
     px, py, pz, dx, dy, _dz = placement
     if pz <= 1e-5:
@@ -576,13 +592,24 @@ def _has_sufficient_base_support(
     if base_area <= 1e-5:
         return False
 
-    item_weight = 0.0
-    if isinstance(item, dict):
-        item_weight = float(item.get("weight", 0.0))
-    elif hasattr(item, "weight"):
-        item_weight = float(getattr(item, "weight", 0.0))
-
     supported_area = 0.0
+
+    # Determine if candidate item is liquid
+    is_cand_liquid = False
+    if isinstance(item, dict):
+        cat_item = str(item.get("category", "")).upper()
+        name_item = str(item.get("name", "")).upper()
+        is_cand_liquid = bool(
+            item.get("is_liquid", False) or
+            "LIQUID" in cat_item or
+            "BEVERAGE" in cat_item or
+            "OIL" in cat_item or
+            "CHEMICAL" in cat_item or
+            "LIQUID" in name_item
+        )
+    elif hasattr(item, "is_liquid"):
+        is_cand_liquid = bool(getattr(item, "is_liquid", False))
+
     for b in placed_boxes:
         if isinstance(b, (tuple, list)):
             ox, oy, oz, odx, ody, odz = b[0], b[1], b[2], b[3], b[4], b[5]
@@ -611,16 +638,50 @@ def _has_sufficient_base_support(
             overlap = x_overlap * y_overlap
 
             if overlap > 1e-5:
-                # Fragile constraint check:
-                # Tuyệt đối không xếp kiện hàng có trọng lượng > 2.0kg đè lên kiện hàng có thuộc tính is_fragile=True
+                # 1. Zero-Load on Fragile (TASK-086 / DOM-05):
+                # Tuyệt đối cấm mọi kiện hàng đè lên sản phẩm có is_fragile=True (xóa bỏ hoàn toàn ngưỡng 2kg)
                 is_box_fragile = False
                 if isinstance(placed_item, dict):
-                    is_box_fragile = bool(placed_item.get("is_fragile", False))
+                    is_box_fragile = bool(
+                        placed_item.get("is_fragile", False) or
+                        "FRAGILE" in str(placed_item.get("category", "")).upper()
+                    )
                 elif hasattr(placed_item, "is_fragile"):
                     is_box_fragile = bool(getattr(placed_item, "is_fragile", False))
 
-                if is_box_fragile and item_weight > 2.0:
+                if is_box_fragile:
                     return False
+
+                # 2. Liquid vs Electronics / Dry goods isolation (TASK-086 / DOM-05):
+                # Nếu item hiện tại là chất lỏng (is_liquid=True) và z > 0 mà bên dưới là đồ điện tử hoặc hàng khô -> REJECT
+                if is_cand_liquid:
+                    is_placed_liquid = False
+                    is_placed_elec_or_dry = False
+                    if isinstance(placed_item, dict):
+                        cat_p = str(placed_item.get("category", "")).upper()
+                        name_p = str(placed_item.get("name", "")).upper()
+                        is_placed_liquid = bool(
+                            placed_item.get("is_liquid", False) or
+                            "LIQUID" in cat_p or
+                            "BEVERAGE" in cat_p or
+                            "OIL" in cat_p or
+                            "CHEMICAL" in cat_p or
+                            "LIQUID" in name_p
+                        )
+                        is_placed_elec_or_dry = bool(
+                            placed_item.get("is_electronic", False) or
+                            placed_item.get("is_dry_goods", False) or
+                            "ELECTRONIC" in cat_p or
+                            "DEVICE" in cat_p or
+                            "DRY" in cat_p or
+                            not is_placed_liquid
+                        )
+                    elif hasattr(placed_item, "is_liquid"):
+                        is_placed_liquid = bool(getattr(placed_item, "is_liquid", False))
+                        is_placed_elec_or_dry = not is_placed_liquid
+
+                    if is_placed_elec_or_dry:
+                        return False
 
                 supported_area += overlap
 

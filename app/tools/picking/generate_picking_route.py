@@ -411,10 +411,67 @@ class GeneratePickingRoute(BaseTool):
                     target_exit_y = cross_front_y
 
                 # Walk along cross-aisle or perimeter to enter at target_entry_y
-                cross_travel = abs(aisle_x - curr_x) + abs(curr_y - target_entry_y)
-                total_distance += cross_travel
-                curr_x = aisle_x
-                curr_y = target_entry_y
+                if curr_y != target_entry_y:
+                    # Transition between different corridor ends (Front <-> Back)
+                    # Generate safe perimeter/cross-aisle waypoints so AGV/picker doesn't cut through racks or drive against traffic (DOM-04 / TASK-085)
+                    perimeter_x = max(sorted_aisles) + 2.0 if sorted_aisles else aisle_x + 2.0
+
+                    # Waypoint 1: Current corridor exit
+                    wp1_loc = "CORRIDOR-FRONT" if curr_y == cross_front_y else "CORRIDOR-BACK"
+                    wp1 = {
+                        "stop_number": stop_counter,
+                        "location_code": wp1_loc,
+                        "zone_id": "CORRIDOR",
+                        "type": "WAYPOINT",
+                        "is_waypoint": True,
+                        "x": curr_x,
+                        "y": curr_y,
+                        "z": 0.0,
+                        "instruction": f"Move to {'Front' if curr_y == cross_front_y else 'Back'} cross-aisle corridor."
+                    }
+                    stop_counter += 1
+                    route.append(wp1)
+
+                    # Waypoint 2: Outer perimeter bypass corridor
+                    wp2 = {
+                        "stop_number": stop_counter,
+                        "location_code": "CORRIDOR-PERIMETER",
+                        "zone_id": "CORRIDOR",
+                        "type": "WAYPOINT",
+                        "is_waypoint": True,
+                        "x": perimeter_x,
+                        "y": target_entry_y,
+                        "z": 0.0,
+                        "instruction": f"Navigate via outer perimeter corridor to {'Back' if target_entry_y == cross_back_y else 'Front'} entrance."
+                    }
+                    stop_counter += 1
+                    route.append(wp2)
+
+                    # Waypoint 3: Entry point at target aisle
+                    wp3 = {
+                        "stop_number": stop_counter,
+                        "location_code": f"CORRIDOR-ENTRY-AISLE-{aisle_num:02d}",
+                        "zone_id": "CORRIDOR",
+                        "type": "WAYPOINT",
+                        "is_waypoint": True,
+                        "x": aisle_x,
+                        "y": target_entry_y,
+                        "z": 0.0,
+                        "instruction": f"Enter Aisle {aisle_num:02d} safely at designated one-way entrance."
+                    }
+                    stop_counter += 1
+                    route.append(wp3)
+
+                    # Travel along perimeter bypass
+                    cross_travel = abs(perimeter_x - curr_x) + abs(target_entry_y - curr_y) + abs(aisle_x - perimeter_x)
+                    total_distance += cross_travel
+                    curr_x = aisle_x
+                    curr_y = target_entry_y
+                else:
+                    cross_travel = abs(aisle_x - curr_x)
+                    total_distance += cross_travel
+                    curr_x = aisle_x
+                    curr_y = target_entry_y
 
                 # Pick items along the mandatory one-way direction
                 for p in sorted_picks:
@@ -620,6 +677,22 @@ class GeneratePickingRoute(BaseTool):
                     "location_code": "PACK-STATION",
                     "instruction": f"[Trip {trip_idx}] Drop off all picked items at Packing Station."
                 })
+            elif st_type == "SORTATION_WALL":
+                instructions.append({
+                    "trip": trip_idx,
+                    "stop_number": st["stop_number"],
+                    "location_code": "SORTATION_WALL",
+                    "instruction": f"[Trip {trip_idx}] Deliver batch-picked cart to Put-Wall for item scan & individual order sorting."
+                })
+            elif st_type == "WAYPOINT" or st.get("is_waypoint", False):
+                instructions.append({
+                    "trip": trip_idx,
+                    "stop_number": st["stop_number"],
+                    "location_code": code,
+                    "zone": st.get("zone_id", "CORRIDOR"),
+                    "instruction": f"[Trip {trip_idx}] {st.get('instruction', 'Navigate via corridor waypoint.')}",
+                    "is_waypoint": True
+                })
             else:
                 picked = loc_items.get(code, [])
                 instructions.append({
@@ -649,6 +722,16 @@ class GeneratePickingRoute(BaseTool):
         instructions = []
         for i, loc in enumerate(route):
             c = loc.get("location_code")
+            if loc.get("is_waypoint") or loc.get("type") == "WAYPOINT":
+                instructions.append({
+                    "stop_number": i + 1,
+                    "location_code": c,
+                    "zone": loc.get("zone_id", "CORRIDOR"),
+                    "items_to_pick": [],
+                    "total_items_at_stop": 0,
+                    "instruction": loc.get("instruction", f"Navigate via waypoint {c}")
+                })
+                continue
             at_loc = loc_items.get(c, [])
             instructions.append({
                 "stop_number": i + 1,

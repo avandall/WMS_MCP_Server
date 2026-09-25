@@ -382,13 +382,13 @@ def test_base_support_gravity_constraint_unit():
 
 def test_fragile_constraint_heavy_item_rejected_unit():
     """
-    Acceptance Criteria (TASK-062):
-    Tuyệt đối không xếp kiện hàng có trọng lượng > 2.0kg đè lên kiện hàng có thuộc tính is_fragile=True.
+    Acceptance Criteria (TASK-086 / DOM-05 / TASK-062):
+    Cấm 100% việc đặt bất kỳ kiện hàng nào đè lên is_fragile=True (xóa bỏ hoàn toàn ngưỡng 2kg: Zero-Load on Fragile).
     """
     fragile_base = [(0, 0, 0, 20, 20, 10, {"sku_code": "SKU-GLASS", "is_fragile": True})]
     non_fragile_base = [(0, 0, 0, 20, 20, 10, {"sku_code": "SKU-WOOD", "is_fragile": False})]
 
-    # 1. Heavy item (weight = 2.5kg > 2.0kg) placed on fragile item -> REJECTED
+    # 1. Heavy item (weight = 2.5kg) placed on fragile item -> REJECTED
     heavy_item = {"sku_code": "SKU-HEAVY", "weight": 2.5}
     assert _has_sufficient_base_support(heavy_item, (0, 0, 10, 20, 20, 10), fragile_base) is False
 
@@ -396,9 +396,12 @@ def test_fragile_constraint_heavy_item_rejected_unit():
     very_heavy_item = {"sku_code": "SKU-ANVIL", "weight": 5.0}
     assert _has_sufficient_base_support(very_heavy_item, (0, 0, 10, 20, 20, 10), fragile_base) is False
 
-    # 3. Light item (weight = 1.2kg <= 2.0kg) placed on fragile item -> ALLOWED
-    light_item = {"sku_code": "SKU-LIGHT", "weight": 1.2}
-    assert _has_sufficient_base_support(light_item, (0, 0, 10, 20, 20, 10), fragile_base) is True
+    # 3. Light item (weight = 0.5kg or 1.2kg) placed on fragile item -> REJECTED (Zero-Load on Fragile / TASK-086)
+    light_item_05 = {"sku_code": "SKU-LIGHT-05", "weight": 0.5}
+    assert _has_sufficient_base_support(light_item_05, (0, 0, 10, 20, 20, 10), fragile_base) is False
+
+    light_item_12 = {"sku_code": "SKU-LIGHT-12", "weight": 1.2}
+    assert _has_sufficient_base_support(light_item_12, (0, 0, 10, 20, 20, 10), fragile_base) is False
 
     # 4. Heavy item (weight = 15.0kg) placed on non-fragile item -> ALLOWED
     assert _has_sufficient_base_support(very_heavy_item, (0, 0, 10, 20, 20, 10), non_fragile_base) is True
@@ -843,6 +846,172 @@ def test_sioc_weight_limit_oversized_dimension():
     assert pkg["requires_freight_pallet"] is True
     assert pkg["shipping_method"] == "FREIGHT_PALLET"
     assert pkg["package_type"] == "FREIGHT_PALLET"
+
+
+# ==============================================================================
+# TASK-086: Zero-Load on Fragile & Liquid Isolation (DOM-05)
+# ==============================================================================
+
+def test_zero_load_on_fragile_light_item_rejected_on_glass_bulb():
+    """
+    Acceptance Criteria (TASK-086 / DOM-05):
+    - Xóa bỏ hoàn toàn ngưỡng 2kg; cấm 100% việc đặt kiện hàng đè lên is_fragile=True.
+    - Viết test xác nhận kiện hàng 0.5kg không được xếp đè lên bóng đèn thủy tinh.
+    """
+    # Placed fragile base: glass light bulb (is_fragile=True)
+    glass_bulb_base = [(0, 0, 0, 15, 15, 10, {
+        "sku_code": "SKU-BULB-GLASS",
+        "name": "Glass Light Bulb",
+        "is_fragile": True,
+        "category": "FRAGILE"
+    })]
+
+    # Candidate light item: 0.5kg item
+    light_item = {
+        "sku_code": "SKU-SMALL-ITEM",
+        "name": "Plastic Cover",
+        "weight": 0.5,
+        "length": 15.0,
+        "width": 15.0,
+        "height": 5.0
+    }
+
+    # Stacking 0.5kg item on top of fragile bulb (pz = 10) must be strictly REJECTED
+    assert _has_sufficient_base_support(light_item, (0, 0, 10, 15, 15, 5), glass_bulb_base) is False
+
+    # Even an ultralight 0.05kg item must be REJECTED on fragile item
+    ultralight_item = {
+        "sku_code": "SKU-FEATHER",
+        "name": "Paper Label",
+        "weight": 0.05,
+        "length": 15.0,
+        "width": 15.0,
+        "height": 1.0
+    }
+    assert _has_sufficient_base_support(ultralight_item, (0, 0, 10, 15, 15, 1), glass_bulb_base) is False
+
+
+def test_liquid_isolation_cannot_be_placed_above_electronics_or_dry_goods():
+    """
+    Acceptance Criteria (TASK-086 / DOM-05):
+    - Sản phẩm dạng lỏng không được đặt bên trên sản phẩm điện tử / hàng khô trong cùng thùng carton.
+    - Nếu item hiện tại là chất lỏng (is_liquid=True) và z > 0 mà bên dưới là đồ điện tử -> REJECT vị trí.
+    """
+    # 1. Electronics base at z = 0
+    electronics_base = [(0, 0, 0, 20, 15, 10, {
+        "sku_code": "SKU-TABLET",
+        "name": "Electronic Tablet",
+        "is_electronic": True,
+        "category": "ELECTRONICS",
+        "is_fragile": False
+    })]
+
+    # Candidate liquid: Olive Oil Bottle (is_liquid=True)
+    liquid_bottle = {
+        "sku_code": "SKU-OIL-BOTTLE",
+        "name": "Cooking Oil Bottle",
+        "is_liquid": True,
+        "category": "LIQUID",
+        "weight": 1.0,
+        "length": 20.0,
+        "width": 15.0,
+        "height": 10.0
+    }
+
+    # Liquid placed on top of electronics (pz = 10 > 0) -> REJECTED
+    assert _has_sufficient_base_support(liquid_bottle, (0, 0, 10, 20, 15, 10), electronics_base) is False
+
+    # 2. Dry goods base at z = 0
+    dry_goods_base = [(0, 0, 0, 20, 15, 10, {
+        "sku_code": "SKU-COTTON-SHIRT",
+        "name": "Cotton Clothes",
+        "is_dry_goods": True,
+        "category": "DRY_GOODS",
+        "is_fragile": False
+    })]
+
+    # Liquid placed on top of dry goods (pz = 10 > 0) -> REJECTED
+    assert _has_sufficient_base_support(liquid_bottle, (0, 0, 10, 20, 15, 10), dry_goods_base) is False
+
+    # 3. Liquid placed at floor (pz = 0) -> ALLOWED (resting on carton bottom)
+    assert _has_sufficient_base_support(liquid_bottle, (0, 0, 0, 20, 15, 10), []) is True
+
+
+@pytest.mark.asyncio
+async def test_3d_bpp_liquid_and_electronics_packing_isolation(mock_db_client, test_config):
+    """
+    Acceptance Criteria (TASK-086 / DOM-05):
+    Order contains a bottle of liquid and an electronic device.
+    In a vertical-stack-only carton (floor area only fits 1 item):
+    Liquid cannot be placed on top of the electronic device.
+    """
+    order_items = [
+        {
+            "sku_code": "SKU-ELEC-IPAD",
+            "name": "iPad Pro",
+            "quantity": 1,
+            "length": 20.0,
+            "width": 15.0,
+            "height": 10.0,
+            "weight": 2.0,  # heavier -> packed first at bottom z=0
+            "allow_rotation": False,
+            "is_electronic": True,
+            "category": "ELECTRONICS"
+        },
+        {
+            "sku_code": "SKU-SHAMPOO",
+            "name": "Liquid Shampoo 500ml",
+            "quantity": 1,
+            "length": 20.0,
+            "width": 15.0,
+            "height": 10.0,
+            "weight": 0.8,
+            "allow_rotation": False,
+            "is_liquid": True,
+            "category": "LIQUID"
+        }
+    ]
+
+    # Box 1: Vertical Stack Box (floor 22.5 x 18: fits only ONE item; requires vertical stack)
+    # Since iPad is placed at z=0, Shampoo would have to be placed at z=10 on top of iPad -> MUST FAIL
+    # Box 2: Wide Box (floor 45 x 20: fits BOTH side-by-side at z=0) -> MUST SUCCEED
+    candidate_boxes = [
+        {
+            "box_id": "BOX-STACK-VERTICAL-ONLY",
+            "name": "Vertical Stack Box",
+            "length": 25.0,
+            "width": 20.0,
+            "height": 25.0,
+            "max_weight": 20.0,
+            "volume": 12500.0
+        },
+        {
+            "box_id": "BOX-WIDE-SIDE-BY-SIDE",
+            "name": "Wide Side-by-Side Box",
+            "length": 50.0,
+            "width": 25.0,
+            "height": 15.0,
+            "max_weight": 20.0,
+            "volume": 18750.0
+        }
+    ]
+
+    mock_db_client.fetch_many.side_effect = [
+        order_items,
+        candidate_boxes
+    ]
+
+    tool = SuggestPackingBox(test_config)
+    tool.db = mock_db_client
+
+    result = await tool.execute(order_id="ORD-LIQUID-ELEC-01")
+    assert result.success is True
+    recs = result.data["recommendations"]
+    assert len(recs) == 1
+    # Must pick the wide side-by-side box where both sit safely at z=0!
+    # Vertical stack box must be rejected because liquid cannot stack on top of electronics!
+    assert recs[0]["box_id"] == "BOX-WIDE-SIDE-BY-SIDE"
+
 
 
 

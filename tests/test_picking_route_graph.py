@@ -512,3 +512,124 @@ async def test_sortation_wall_in_batch_picking_route(mock_db_client, test_config
     assert data["route_metrics"]["total_distance_m"] > std_data["route_metrics"]["total_distance_m"]
 
 
+# ==============================================================================
+# TASK-085: Safe Waypoints for One-Way Aisle Transitions (DOM-04)
+# ==============================================================================
+
+@pytest.mark.asyncio
+async def test_one_way_aisle_waypoints_between_even_aisles(mock_db_client, test_config):
+    """
+    Acceptance Criteria (TASK-085 / DOM-04):
+    Khi xe nâng kết thúc ở Dãy 2 tại đầu Front (Y = 0), điểm nhặt tiếp theo ở Dãy 4 bắt buộc phải vào từ đầu Back (Y = 50).
+    - Trong generate_picking_route.py, khi curr_y != target_entry_y, thuật toán sinh ít nhất 1 Waypoint chuyển tiếp
+      (is_waypoint=True, type="WAYPOINT", zone_id="CORRIDOR") đánh dấu hành lang an toàn.
+    - Lộ trình chuyển từ Dãy 2 sang Dãy 4 có chứa điểm trung chuyển hành lang, không nhảy cóc trực tiếp tọa độ.
+    - Triệt tiêu hoàn toàn nguy cơ đi ngược chiều hoặc đâm va trong VNA.
+    """
+    items_mock = [
+        # Dãy 2 (Even): x=6.0, Y descending (Back -> Front)
+        {
+            "sku_code": "SKU-A2-40",
+            "quantity": 1,
+            "weight_kg": 2.0,
+            "location_code": "ZONE-A-A02-B08",
+            "aisle": "AISLE-02",
+            "x_coordinate": 6.0,
+            "y_coordinate": 40.0
+        },
+        {
+            "sku_code": "SKU-A2-10",
+            "quantity": 1,
+            "weight_kg": 2.0,
+            "location_code": "ZONE-A-A02-B02",
+            "aisle": "AISLE-02",
+            "x_coordinate": 6.0,
+            "y_coordinate": 10.0
+        },
+        # Dãy 4 (Even): x=12.0, Y descending (Back -> Front)
+        {
+            "sku_code": "SKU-A4-45",
+            "quantity": 1,
+            "weight_kg": 2.0,
+            "location_code": "ZONE-A-A04-B09",
+            "aisle": "AISLE-04",
+            "x_coordinate": 12.0,
+            "y_coordinate": 45.0
+        },
+        {
+            "sku_code": "SKU-A4-20",
+            "quantity": 1,
+            "weight_kg": 2.0,
+            "location_code": "ZONE-A-A04-B04",
+            "aisle": "AISLE-04",
+            "x_coordinate": 12.0,
+            "y_coordinate": 20.0
+        }
+    ]
+
+    mock_db_client.fetch_many.return_value = items_mock
+
+    tool = GeneratePickingRoute(test_config)
+    tool.db = mock_db_client
+
+    result = await tool.execute(order_id="ORD-WAYPOINT-01", enforce_one_way=True)
+    assert result.success is True
+
+    trips = result.data["trips"]
+    assert len(trips) == 1
+    route = trips[0]["route"]
+
+    # 1. Verify that waypoints exist with is_waypoint=True
+    waypoints = [s for s in route if s.get("is_waypoint") is True]
+    assert len(waypoints) >= 1, "Must generate at least 1 transition waypoint"
+    for wp in waypoints:
+        assert wp.get("type") == "WAYPOINT"
+        assert wp.get("zone_id") == "CORRIDOR"
+
+    # 2. Find the transition between last pick in Aisle 2 and first pick in Aisle 4
+    # Last pick in Aisle 2: ZONE-A-A02-B02 (y=10.0)
+    # First pick in Aisle 4: ZONE-A-A04-B09 (y=45.0)
+    stop_codes = [s["location_code"] for s in route]
+    a2_last_idx = stop_codes.index("ZONE-A-A02-B02")
+    a4_first_idx = stop_codes.index("ZONE-A-A04-B09")
+
+    assert a4_first_idx > a2_last_idx + 1, "Route must NOT jump directly from Aisle 2 to Aisle 4 without corridor waypoints!"
+
+    # Slice intermediate stops between A2 and A4
+    transition_stops = route[a2_last_idx + 1 : a4_first_idx]
+    transition_codes = [s["location_code"] for s in transition_stops]
+
+    # Verify transition contains Front corridor exit, Perimeter bypass corridor, and Aisle 4 Back entry
+    assert "CORRIDOR-FRONT" in transition_codes
+    assert "CORRIDOR-PERIMETER" in transition_codes
+    assert "CORRIDOR-ENTRY-AISLE-04" in transition_codes
+
+    # 3. Verify each transition stop has is_waypoint=True and valid coordinates
+    for st in transition_stops:
+        assert st.get("is_waypoint") is True
+        assert st.get("type") == "WAYPOINT"
+        assert st.get("zone_id") == "CORRIDOR"
+
+    # 4. Verify coordinate continuity during transition:
+    # Aisle 2 exit: Front (y=0) -> Perimeter bypass (y=50) -> Aisle 4 Back entrance (y=50)
+    corridor_front = next(s for s in transition_stops if s["location_code"] == "CORRIDOR-FRONT")
+    assert corridor_front["y"] == 0.0
+    assert corridor_front["x"] == 6.0  # at Aisle 2 exit
+
+    corridor_perimeter = next(s for s in transition_stops if s["location_code"] == "CORRIDOR-PERIMETER")
+    assert corridor_perimeter["y"] == 50.0  # moved up to Back cross-aisle
+    assert corridor_perimeter["x"] >= 12.0  # perimeter lane outside racking
+
+    corridor_entry_a4 = next(s for s in transition_stops if s["location_code"] == "CORRIDOR-ENTRY-AISLE-04")
+    assert corridor_entry_a4["y"] == 50.0  # entry at Back of Aisle 4
+    assert corridor_entry_a4["x"] == 12.0  # aligned with Aisle 4
+
+    # 5. Verify instructions for waypoints exist in trip instructions
+    instructions = trips[0]["instructions"]
+    wp_instructions = [ins for ins in instructions if ins.get("is_waypoint") is True]
+    assert len(wp_instructions) >= len(transition_stops)
+    for ins in wp_instructions:
+        assert "Navigate via" in ins["instruction"] or "corridor" in ins["instruction"].lower() or "safely" in ins["instruction"].lower()
+
+
+
