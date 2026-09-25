@@ -74,6 +74,9 @@ class SuggestPackingBox(BaseTool):
                         if not is_fragile:
                             is_fragile = bool(item.get("is_fragile", False) or "FRAGILE" in str(category).upper())
                         
+                        case_size = prod_dim.get("case_size", 1) if prod_dim else 1
+                        uoms = prod_dim.get("uoms", []) if prod_dim else []
+                        
                         order_items.append({
                             "sku_code": item.get("sku_code", f"SKU-{item.get('product_id', 1)}"),
                             "name": prod_dim.get("name", "") if prod_dim else "",
@@ -86,6 +89,8 @@ class SuggestPackingBox(BaseTool):
                             "hazmat_class": hazmat_class,
                             "category": category,
                             "is_fragile": is_fragile,
+                            "case_size": int(case_size),
+                            "uoms": uoms,
                             "item_volume": float(length * width * height),
                             "total_weight": float(weight * qty)
                         })
@@ -111,6 +116,8 @@ class SuggestPackingBox(BaseTool):
                 cat = it.get("category", "GENERAL")
                 name = it.get("name", "")
                 is_frag = bool(it.get("is_fragile", False) or "FRAGILE" in str(cat).upper())
+                case_sz = int(it.get("case_size", 1))
+                uoms_list = it.get("uoms", [])
                 
                 sanitized_items.append({
                     "sku_code": it.get("sku_code", "UNKNOWN"),
@@ -124,12 +131,43 @@ class SuggestPackingBox(BaseTool):
                     "hazmat_class": hazmat,
                     "category": cat,
                     "is_fragile": is_frag,
+                    "case_size": case_sz,
+                    "uoms": uoms_list,
                     "item_volume": l * w * h,
                     "total_weight": wt * q
                 })
             
-            # 1. Check Hazmat Incompatibility Segregation
-            is_compatible, conflict_msg = self._check_hazmat_segregation(sanitized_items)
+            # 1. Automatic Recognition of SIOC Master Cartons (TASK-068 / DOM-03)
+            sioc_packages, loose_items = self._partition_sioc_items(sanitized_items)
+            
+            # Case 1: All items are packed in master carton SIOC packages (no loose items)
+            if sioc_packages and not loose_items:
+                await self.db.disconnect()
+                total_sioc_weight = sum(pkg["gross_weight_kg"] for pkg in sioc_packages)
+                return ToolResult(
+                    success=True,
+                    data={
+                        "order_id": input_data.order_id,
+                        "order_items": sanitized_items,
+                        "is_fully_sioc": True,
+                        "sioc_packages": sioc_packages,
+                        "loose_items": [],
+                        "total_packages": len(sioc_packages),
+                        "total_weight_kg": round(total_sioc_weight, 2),
+                        "recommendations": [],
+                        "selected_recommendation": {
+                            "package_type": "SIOC",
+                            "message": f"Toàn bộ đơn hàng ({len(sioc_packages)} kiện) xuất nguyên thùng SIOC. Không xé lẻ đóng hộp lại.",
+                            "total_sioc_packages": len(sioc_packages)
+                        }
+                    }
+                )
+            
+            # Items subject to carton packing (loose items if SIOC partitioned, else all)
+            items_to_pack = loose_items if loose_items else sanitized_items
+            
+            # 2. Check Hazmat Incompatibility Segregation
+            is_compatible, conflict_msg = self._check_hazmat_segregation(items_to_pack)
             if not is_compatible:
                 await self.db.disconnect()
                 return ToolResult(
@@ -139,21 +177,22 @@ class SuggestPackingBox(BaseTool):
                     data={
                         "order_id": input_data.order_id,
                         "hazmat_incompatible": True,
-                        "conflict_detail": conflict_msg
+                        "conflict_detail": conflict_msg,
+                        "sioc_packages": sioc_packages
                     }
                 )
             
-            # Calculate aggregate statistics
-            total_volume = sum(item["item_volume"] * item["quantity"] for item in sanitized_items)
-            total_weight = sum(item["total_weight"] for item in sanitized_items)
+            # Calculate aggregate statistics for items to pack in carton
+            total_volume = sum(item["item_volume"] * item["quantity"] for item in items_to_pack)
+            total_weight = sum(item["total_weight"] for item in items_to_pack)
             
             # Fetch candidate boxes
             available_boxes = await self._get_available_boxes()
             await self.db.disconnect()
             
-            # 2. Run 3D-BPP Geometric Packing & DIM Weight Optimization
+            # 3. Run 3D-BPP Geometric Packing & DIM Weight Optimization
             recommendations = self._find_optimal_boxes_3d(
-                sanitized_items,
+                items_to_pack,
                 total_volume,
                 total_weight,
                 available_boxes,
@@ -169,9 +208,11 @@ class SuggestPackingBox(BaseTool):
                     data={
                         "order_id": input_data.order_id,
                         "order_items": sanitized_items,
+                        "sioc_packages": sioc_packages,
+                        "loose_items": loose_items,
                         "total_volume_cm3": round(total_volume, 2),
                         "total_weight_kg": round(total_weight, 2),
-                        "item_count": len(sanitized_items),
+                        "item_count": len(items_to_pack),
                         "available_box_count": len(available_boxes)
                     }
                 )
@@ -181,9 +222,12 @@ class SuggestPackingBox(BaseTool):
                 data={
                     "order_id": input_data.order_id,
                     "order_items": sanitized_items,
+                    "is_fully_sioc": False,
+                    "sioc_packages": sioc_packages,
+                    "loose_items": loose_items,
                     "total_volume_cm3": round(total_volume, 2),
                     "total_weight_kg": round(total_weight, 2),
-                    "item_count": len(sanitized_items),
+                    "item_count": len(items_to_pack),
                     "dunnage_buffer_percent": 10.0,
                     "recommendations": recommendations,
                     "selected_recommendation": recommendations[0] if recommendations else None
@@ -246,6 +290,13 @@ class SuggestPackingBox(BaseTool):
             {"box_id": 5, "name": "Long Heavy Box (XXL)", "length": 140.0, "width": 40.0, "height": 30.0, "max_weight": 50.0, "volume": 168000.0}
         ]
     
+    def _partition_sioc_items(
+        self,
+        items: list[dict[str, Any]]
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Partition order items into SIOC master carton packages and loose items (TASK-068 / DOM-03)"""
+        return partition_sioc_items(items)
+
     def _find_optimal_boxes_3d(
         self,
         items: list[dict[str, Any]],
@@ -260,6 +311,7 @@ class SuggestPackingBox(BaseTool):
         2. 3D-BPP Geometric Packing check with rotation constraints (Extreme Points / First-Fit Decreasing 3D)
         3. Weight limit check
         4. Dimensional Weight (DIM Weight = L*W*H / 5000) & Billable Weight optimization
+        5. Center of Gravity (CoG) balance optimization (TASK-067 / DOM-02)
         """
         recommendations = []
         
@@ -283,8 +335,8 @@ class SuggestPackingBox(BaseTool):
             if usable_volume < total_volume:
                 continue
             
-            # 3D Bin Packing Check
-            fits_in_box = self._can_pack_items_3d(items, usable_l, usable_w, usable_h)
+            # 3D Bin Packing Check with Center of Gravity optimization
+            fits_in_box, placed_boxes, cog_info = self._pack_items_3d(items, usable_l, usable_w, usable_h)
             if not fits_in_box:
                 continue
             
@@ -298,6 +350,8 @@ class SuggestPackingBox(BaseTool):
             
             # Recommendation score: higher efficiency, lower wasted space, lower billable weight
             score = efficiency - (wasted_space / 10000.0) - (billable_weight * 0.5)
+            if not cog_info.get("is_balanced", True):
+                score -= 30.0  # Penalize severe CoG imbalance
             
             recommendations.append({
                 "box_id": box.get("box_id"),
@@ -320,7 +374,16 @@ class SuggestPackingBox(BaseTool):
                 "billable_weight_kg": round(billable_weight, 2),
                 "efficiency_percent": round(efficiency, 2),
                 "wasted_space_cm3": round(wasted_space, 2),
-                "recommendation_score": round(score, 2)
+                "recommendation_score": round(score, 2),
+                "center_of_gravity": cog_info.get("center_of_gravity"),
+                "geometric_center": cog_info.get("geometric_center"),
+                "is_cog_balanced": cog_info.get("is_balanced", True),
+                "cog_status": cog_info.get("status", "BALANCED"),
+                "cog_offset_x": cog_info.get("offset_x", 0.0),
+                "cog_offset_y": cog_info.get("offset_y", 0.0),
+                "cog_offset_ratio_x": cog_info.get("offset_ratio_x", 0.0),
+                "cog_offset_ratio_y": cog_info.get("offset_ratio_y", 0.0),
+                "placed_items_count": len(placed_boxes)
             })
         
         # Sort recommendations: lowest billable weight first, then highest efficiency
@@ -351,9 +414,23 @@ class SuggestPackingBox(BaseTool):
         box_w: float,
         box_h: float
     ) -> bool:
+        """Check if all items fit into the 3D box under rotation constraints."""
+        fits, _, _ = self._pack_items_3d(items, box_l, box_w, box_h)
+        return fits
+
+    def _pack_items_3d(
+        self,
+        items: list[dict[str, Any]],
+        box_l: float,
+        box_w: float,
+        box_h: float
+    ) -> tuple[bool, list[Any], dict[str, Any]]:
         """
-        Check if all items fit into the 3D box under rotation constraints.
+        Check if all items fit into the 3D box under rotation constraints and
+        calculate/optimize Center of Gravity (CoG) (TASK-067 / DOM-02).
         Implements Extreme Points 3D placement algorithm with gravity & base support constraints.
+        Returns:
+            (success, placed_boxes, cog_info)
         """
         # Flatten individual unit items
         expanded_items: list[dict[str, Any]] = []
@@ -457,9 +534,13 @@ class SuggestPackingBox(BaseTool):
                     break
             
             if not placed:
-                return False
+                return False, [], {}
         
-        return True
+        # Center of Gravity Optimization: Adjust placement towards center of carton (TASK-067 / DOM-02)
+        adjusted_boxes = adjust_placement_for_center_of_gravity(placed_boxes, box_l, box_w, box_h)
+        cog_info = check_center_of_gravity(adjusted_boxes, box_l, box_w, box_h, max_offset_ratio=0.20)
+        
+        return True, adjusted_boxes, cog_info
 
 
 def _has_sufficient_base_support(
@@ -535,4 +616,273 @@ def _has_sufficient_base_support(
 
     support_ratio = supported_area / base_area
     return support_ratio + 1e-5 >= min_ratio
+
+
+def calculate_center_of_gravity(
+    placed_boxes: list[Any],
+    box_l: float,
+    box_w: float,
+    box_h: float
+) -> tuple[float, float, float]:
+    """Calculate the 3D center of gravity (X_cg, Y_cg, Z_cg) of placed boxes within a carton (TASK-067 / DOM-02).
+    
+    Formula:
+        x_i = px_i + dx_i / 2
+        y_i = py_i + dy_i / 2
+        z_i = pz_i + dz_i / 2
+        
+        X_cg = SUM(m_i * x_i) / SUM(m_i)
+        Y_cg = SUM(m_i * y_i) / SUM(m_i)
+        Z_cg = SUM(m_i * z_i) / SUM(m_i)
+    """
+    if not placed_boxes:
+        return (round(box_l / 2.0, 2), round(box_w / 2.0, 2), round(box_h / 2.0, 2))
+        
+    total_mass = 0.0
+    sum_mx = 0.0
+    sum_my = 0.0
+    sum_mz = 0.0
+    
+    for b in placed_boxes:
+        if isinstance(b, (tuple, list)):
+            px, py, pz, dx, dy, dz = float(b[0]), float(b[1]), float(b[2]), float(b[3]), float(b[4]), float(b[5])
+            item_data = b[6] if len(b) > 6 else {}
+            weight = 0.0
+            if isinstance(item_data, dict):
+                weight = float(item_data.get("weight", 0.0))
+            elif hasattr(item_data, "weight"):
+                weight = float(getattr(item_data, "weight", 0.0))
+        elif isinstance(b, dict):
+            px = float(b.get("px", b.get("x", 0.0)))
+            py = float(b.get("py", b.get("y", 0.0)))
+            pz = float(b.get("pz", b.get("z", 0.0)))
+            dx = float(b.get("dx", b.get("length", 0.0)))
+            dy = float(b.get("dy", b.get("width", 0.0)))
+            dz = float(b.get("dz", b.get("height", 0.0)))
+            weight = float(b.get("weight", 0.0))
+        else:
+            px = float(getattr(b, "x", 0.0))
+            py = float(getattr(b, "y", 0.0))
+            pz = float(getattr(b, "z", 0.0))
+            dx = float(getattr(b, "dx", 0.0))
+            dy = float(getattr(b, "dy", 0.0))
+            dz = float(getattr(b, "dz", 0.0))
+            weight = float(getattr(b, "weight", 0.0))
+            
+        m_i = max(0.0, weight)
+        xi = px + dx / 2.0
+        yi = py + dy / 2.0
+        zi = pz + dz / 2.0
+        
+        sum_mx += m_i * xi
+        sum_my += m_i * yi
+        sum_mz += m_i * zi
+        total_mass += m_i
+        
+    if total_mass <= 1e-6:
+        return (round(box_l / 2.0, 2), round(box_w / 2.0, 2), round(box_h / 2.0, 2))
+        
+    x_cg = sum_mx / total_mass
+    y_cg = sum_my / total_mass
+    z_cg = sum_mz / total_mass
+    
+    return (round(x_cg, 2), round(y_cg, 2), round(z_cg, 2))
+
+
+def check_center_of_gravity(
+    placed_boxes: list[Any],
+    box_l: float,
+    box_w: float,
+    box_h: float,
+    max_offset_ratio: float = 0.20
+) -> dict[str, Any]:
+    """Check if the center of gravity is within the safe threshold (<= 20% offset from carton geometric center).
+    
+    Acceptance Criteria (TASK-067 / DOM-02):
+        |X_cg - L/2| <= 0.20 * L AND |Y_cg - W/2| <= 0.20 * W
+    """
+    x_cg, y_cg, z_cg = calculate_center_of_gravity(placed_boxes, box_l, box_w, box_h)
+    geom_x = box_l / 2.0
+    geom_y = box_w / 2.0
+    geom_z = box_h / 2.0
+    
+    offset_x = abs(x_cg - geom_x)
+    offset_y = abs(y_cg - geom_y)
+    
+    max_allowed_x = max_offset_ratio * box_l
+    max_allowed_y = max_offset_ratio * box_w
+    
+    offset_ratio_x = (offset_x / box_l) if box_l > 0 else 0.0
+    offset_ratio_y = (offset_y / box_w) if box_w > 0 else 0.0
+    
+    is_balanced = (offset_x <= max_allowed_x + 1e-5) and (offset_y <= max_allowed_y + 1e-5)
+    
+    return {
+        "is_balanced": is_balanced,
+        "center_of_gravity": (x_cg, y_cg, z_cg),
+        "geometric_center": (round(geom_x, 2), round(geom_y, 2), round(geom_z, 2)),
+        "offset_x": round(offset_x, 2),
+        "offset_y": round(offset_y, 2),
+        "offset_ratio_x": round(offset_ratio_x, 4),
+        "offset_ratio_y": round(offset_ratio_y, 4),
+        "max_allowed_offset_x": round(max_allowed_x, 2),
+        "max_allowed_offset_y": round(max_allowed_y, 2),
+        "status": "BALANCED" if is_balanced else "UNBALANCED_WARNING"
+    }
+
+
+def adjust_placement_for_center_of_gravity(
+    placed_boxes: list[Any],
+    box_l: float,
+    box_w: float,
+    box_h: float
+) -> list[Any]:
+    """Adjust item placement towards the center of the carton bottom to keep
+    the center of gravity within the safe zone (+-20% of carton center).
+    
+    Uses rigid translation on the entire placed cluster to preserve 100% of base support
+    and avoid any collisions (TASK-067 / DOM-02).
+    """
+    if not placed_boxes:
+        return []
+        
+    x_cg, y_cg, _ = calculate_center_of_gravity(placed_boxes, box_l, box_w, box_h)
+    
+    # Find bounding box of all placed items
+    min_x = float("inf")
+    max_x = float("-inf")
+    min_y = float("inf")
+    max_y = float("-inf")
+    
+    extracted = []
+    for b in placed_boxes:
+        if isinstance(b, (tuple, list)):
+            px, py, pz, dx, dy, dz = float(b[0]), float(b[1]), float(b[2]), float(b[3]), float(b[4]), float(b[5])
+            item_data = b[6] if len(b) > 6 else {}
+            is_tuple = True
+        elif isinstance(b, dict):
+            px = float(b.get("px", b.get("x", 0.0)))
+            py = float(b.get("py", b.get("y", 0.0)))
+            pz = float(b.get("pz", b.get("z", 0.0)))
+            dx = float(b.get("dx", b.get("length", 0.0)))
+            dy = float(b.get("dy", b.get("width", 0.0)))
+            dz = float(b.get("dz", b.get("height", 0.0)))
+            item_data = b
+            is_tuple = False
+        else:
+            px = float(getattr(b, "x", 0.0))
+            py = float(getattr(b, "y", 0.0))
+            pz = float(getattr(b, "z", 0.0))
+            dx = float(getattr(b, "dx", 0.0))
+            dy = float(getattr(b, "dy", 0.0))
+            dz = float(getattr(b, "dz", 0.0))
+            item_data = b
+            is_tuple = False
+            
+        min_x = min(min_x, px)
+        max_x = max(max_x, px + dx)
+        min_y = min(min_y, py)
+        max_y = max(max_y, py + dy)
+        extracted.append((is_tuple, px, py, pz, dx, dy, dz, item_data))
+        
+    # Desired shift to align CoG with geometric center (box_l / 2, box_w / 2)
+    target_shift_x = (box_l / 2.0) - x_cg
+    target_shift_y = (box_w / 2.0) - y_cg
+    
+    # Boundary clamp: cluster must stay completely within [0, box_l] and [0, box_w]
+    shift_x = max(-min_x, min(box_l - max_x, target_shift_x))
+    shift_y = max(-min_y, min(box_w - max_y, target_shift_y))
+    
+    adjusted_boxes = []
+    for is_tuple, px, py, pz, dx, dy, dz, item_data in extracted:
+        new_px = round(px + shift_x, 2)
+        new_py = round(py + shift_y, 2)
+        if is_tuple:
+            adjusted_boxes.append((new_px, new_py, pz, dx, dy, dz, item_data))
+        else:
+            if isinstance(item_data, dict):
+                new_dict = dict(item_data)
+                if "px" in new_dict:
+                    new_dict["px"] = new_px
+                if "x" in new_dict:
+                    new_dict["x"] = new_px
+                if "py" in new_dict:
+                    new_dict["py"] = new_py
+                if "y" in new_dict:
+                    new_dict["y"] = new_py
+                adjusted_boxes.append(new_dict)
+            else:
+                setattr(item_data, "x", new_px)
+                setattr(item_data, "y", new_py)
+                adjusted_boxes.append(item_data)
+                
+    return adjusted_boxes
+
+
+def partition_sioc_items(
+    items: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """
+    Partition order items into master carton SIOC packages and loose items.
+    
+    Formula (Acceptance Criteria TASK-068 / DOM-03):
+        Cases = Q // Case Size
+        Loose = Q % Case Size
+        
+    Args:
+        items: List of item dictionaries with quantity, case_size (or uoms), weight, dimensions.
+        
+    Returns:
+        (sioc_packages, loose_items)
+    """
+    sioc_packages: list[dict[str, Any]] = []
+    loose_items: list[dict[str, Any]] = []
+    
+    for it in items:
+        sku = it.get("sku_code", "UNKNOWN")
+        name = it.get("name", "")
+        qty = int(it.get("quantity", 1))
+        
+        # Detect case size from explicit field or UOM conversions
+        case_size = int(it.get("case_size", 1))
+        if case_size <= 1 and it.get("uoms"):
+            for u in it["uoms"]:
+                u_code = str(u.get("uom_code", "")).upper()
+                c_factor = float(u.get("conversion_factor", 1.0))
+                if u_code in ["CASE", "CS", "CARTON", "BOX"] and c_factor > 1:
+                    case_size = int(c_factor)
+                    break
+        
+        # Check if eligible for SIOC (has valid case packaging and qty >= case_size)
+        if case_size > 1 and qty >= case_size:
+            cases_count = qty // case_size
+            loose_count = qty % case_size
+            
+            unit_weight = float(it.get("weight", 0.0))
+            case_weight = round(unit_weight * case_size, 2)
+            
+            for c_idx in range(cases_count):
+                sioc_packages.append({
+                    "package_id": f"SIOC-{sku}-{c_idx + 1}",
+                    "package_type": "SIOC",
+                    "is_sioc": True,
+                    "sku_code": sku,
+                    "name": name,
+                    "case_index": c_idx + 1,
+                    "total_cases": cases_count,
+                    "quantity_per_case": case_size,
+                    "gross_weight_kg": case_weight,
+                    "shipping_label": f"SHIP-SIOC-{sku}-{c_idx + 1}",
+                    "instructions": "Dán nhãn vận chuyển trực tiếp lên thùng nguyên seal của nhà sản xuất (SIOC). Không đóng gói lại."
+                })
+                
+            if loose_count > 0:
+                loose_item = dict(it)
+                loose_item["quantity"] = loose_count
+                loose_item["total_weight"] = round(unit_weight * loose_count, 2)
+                loose_items.append(loose_item)
+        else:
+            loose_items.append(dict(it))
+            
+    return sioc_packages, loose_items
 

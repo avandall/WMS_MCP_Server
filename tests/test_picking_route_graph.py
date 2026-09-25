@@ -343,3 +343,172 @@ async def test_generate_picking_route_uses_real_grpc_coordinates(mock_db_client,
     assert pick_stops[0]["y"] == 12.0
     assert pick_stops[1]["x"] == 6.0
     assert pick_stops[1]["y"] == 38.0
+
+
+@pytest.mark.asyncio
+async def test_one_way_aisle_rule_enforcement(mock_db_client, test_config):
+    """
+    Acceptance Criteria (TASK-066 / DOM-01):
+    Khi enforce_one_way = True (mặc định):
+    - Trong dãy lẻ (Aisle 1, 3, ...): Các điểm nhặt hàng bắt buộc sắp xếp theo tọa độ Y tăng dần (Y1 <= Y2 <= ...) (Front -> Back).
+    - Trong dãy chẵn (Aisle 2, 4, ...): Các điểm nhặt hàng bắt buộc sắp xếp theo tọa độ Y giảm dần (Y1 >= Y2 >= ...) (Back -> Front).
+    - Triệt tiêu 100% nguy cơ xe nâng đi đối đầu trong lối đi hẹp (VNA).
+    """
+    # 3 aisles with scrambled pick items:
+    # Aisle 1 (Odd): y=35, y=10, y=25 -> Must become: 10, 25, 35 (ASC)
+    # Aisle 2 (Even): y=15, y=40, y=28 -> Must become: 40, 28, 15 (DESC)
+    # Aisle 3 (Odd): y=48, y=8 -> Must become: 8, 48 (ASC)
+    items_mock = [
+        # Aisle 1 (Odd)
+        {"sku_code": "SKU-A1-35", "quantity": 1, "weight_kg": 1.0, "location_code": "ZONE-A-A01-B07", "aisle": "AISLE-01", "x_coordinate": 3.0, "y_coordinate": 35.0},
+        {"sku_code": "SKU-A1-10", "quantity": 1, "weight_kg": 1.0, "location_code": "ZONE-A-A01-B02", "aisle": "AISLE-01", "x_coordinate": 3.0, "y_coordinate": 10.0},
+        {"sku_code": "SKU-A1-25", "quantity": 1, "weight_kg": 1.0, "location_code": "ZONE-A-A01-B05", "aisle": "AISLE-01", "x_coordinate": 3.0, "y_coordinate": 25.0},
+        # Aisle 2 (Even)
+        {"sku_code": "SKU-A2-15", "quantity": 1, "weight_kg": 1.0, "location_code": "ZONE-A-A02-B03", "aisle": "AISLE-02", "x_coordinate": 6.0, "y_coordinate": 15.0},
+        {"sku_code": "SKU-A2-40", "quantity": 1, "weight_kg": 1.0, "location_code": "ZONE-A-A02-B08", "aisle": "AISLE-02", "x_coordinate": 6.0, "y_coordinate": 40.0},
+        {"sku_code": "SKU-A2-28", "quantity": 1, "weight_kg": 1.0, "location_code": "ZONE-A-A02-B06", "aisle": "AISLE-02", "x_coordinate": 6.0, "y_coordinate": 28.0},
+        # Aisle 3 (Odd)
+        {"sku_code": "SKU-A3-48", "quantity": 1, "weight_kg": 1.0, "location_code": "ZONE-A-A03-B09", "aisle": "AISLE-03", "x_coordinate": 9.0, "y_coordinate": 48.0},
+        {"sku_code": "SKU-A3-08", "quantity": 1, "weight_kg": 1.0, "location_code": "ZONE-A-A03-B01", "aisle": "AISLE-03", "x_coordinate": 9.0, "y_coordinate": 8.0},
+    ]
+
+    mock_db_client.fetch_many.return_value = items_mock
+
+    tool = GeneratePickingRoute(test_config)
+    tool.db = mock_db_client
+
+    # Execute with enforce_one_way=True (explicit and default)
+    result = await tool.execute(order_id="ORD-ONE-WAY-01", enforce_one_way=True)
+    assert result.success is True
+    assert result.data["route_metrics"]["enforce_one_way"] is True
+
+    route = result.data["trips"][0]["route"]
+    picks = [s for s in route if s.get("type") == "PICK"]
+    assert len(picks) == 8
+
+    # Extract picks by aisle
+    a1_picks = [p for p in picks if p["x"] == 3.0]
+    a2_picks = [p for p in picks if p["x"] == 6.0]
+    a3_picks = [p for p in picks if p["x"] == 9.0]
+
+    assert len(a1_picks) == 3
+    assert len(a2_picks) == 3
+    assert len(a3_picks) == 2
+
+    # Verification: Aisle 1 (Odd) is strictly Y ASCENDING (10 -> 25 -> 35)
+    a1_y = [p["y"] for p in a1_picks]
+    assert a1_y == [10.0, 25.0, 35.0]
+    for idx in range(len(a1_y) - 1):
+        assert a1_y[idx] <= a1_y[idx + 1], f"Aisle 1 violation: {a1_y}"
+
+    # Verification: Aisle 2 (Even) is strictly Y DESCENDING (40 -> 28 -> 15)
+    a2_y = [p["y"] for p in a2_picks]
+    assert a2_y == [40.0, 28.0, 15.0]
+    for idx in range(len(a2_y) - 1):
+        assert a2_y[idx] >= a2_y[idx + 1], f"Aisle 2 violation: {a2_y}"
+
+    # Verification: Aisle 3 (Odd) is strictly Y ASCENDING (8 -> 48)
+    a3_y = [p["y"] for p in a3_picks]
+    assert a3_y == [8.0, 48.0]
+    for idx in range(len(a3_y) - 1):
+        assert a3_y[idx] <= a3_y[idx + 1], f"Aisle 3 violation: {a3_y}"
+
+
+@pytest.mark.asyncio
+async def test_one_way_aisle_rule_schema_and_defaults(test_config):
+    """Verify input schema reflects enforce_one_way=True by default."""
+    tool = GeneratePickingRoute(test_config)
+    schema = tool.get_input_schema()
+    props = schema["properties"]
+    assert "enforce_one_way" in props
+    assert props["enforce_one_way"]["type"] == "boolean"
+    assert props["enforce_one_way"]["default"] is True
+    assert "is_batch_pick" in props
+    assert props["is_batch_pick"]["type"] == "boolean"
+    assert props["is_batch_pick"]["default"] is False
+
+
+# ==============================================================================
+# TASK-069: Put-Wall Sortation in Batch Picking (DOM-04)
+# ==============================================================================
+
+@pytest.mark.asyncio
+async def test_sortation_wall_in_batch_picking_route(mock_db_client, test_config):
+    """
+    Acceptance Criteria (TASK-069 / DOM-04):
+    Thêm điểm dừng SORTATION_WALL trước PACK-STATION khi is_batch_pick = True.
+    Tính toán khoảng cách và thời gian di chuyển bao gồm cả chặng phân loại Put-Wall.
+    """
+    items_mock = [
+        {
+            "sku_code": "SKU-BATCH-01",
+            "quantity": 5,
+            "weight_kg": 1.0,
+            "location_code": "LOC-A1-1",
+            "x_coordinate": 3.0,
+            "y_coordinate": 15.0
+        },
+        {
+            "sku_code": "SKU-BATCH-02",
+            "quantity": 10,
+            "weight_kg": 0.5,
+            "location_code": "LOC-A2-1",
+            "x_coordinate": 6.0,
+            "y_coordinate": 20.0
+        }
+    ]
+    mock_db_client.fetch_many.return_value = items_mock
+
+    tool = GeneratePickingRoute(test_config)
+    tool.db = mock_db_client
+
+    # 1. Execute with is_batch_pick = True
+    result_batch = await tool.execute(
+        order_id="ORD-BATCH-WAVE-01",
+        is_batch_pick=True,
+        sortation_wall_x=0.0,
+        sortation_wall_y=10.0
+    )
+    assert result_batch.success is True
+    data = result_batch.data
+    assert data["route_metrics"]["is_batch_pick"] is True
+    assert data["route_metrics"]["has_sortation_wall"] is True
+
+    route = data["trips"][0]["route"]
+    location_codes = [s["location_code"] for s in route]
+
+    # Verify SORTATION_WALL exists and is positioned immediately before PACK-STATION
+    assert "SORTATION_WALL" in location_codes
+    assert "PACK-STATION" in location_codes
+    sort_idx = location_codes.index("SORTATION_WALL")
+    pack_idx = location_codes.index("PACK-STATION")
+    assert pack_idx == sort_idx + 1
+
+    # Verify stop details
+    sort_stop = route[sort_idx]
+    assert sort_stop["type"] == "SORTATION_WALL"
+    assert sort_stop["zone_id"] == "SORTATION"
+    assert sort_stop["x"] == 0.0
+    assert sort_stop["y"] == 10.0
+    assert "Put-Wall" in sort_stop["instruction"]
+
+    # 2. Execute with is_batch_pick = False (Standard single-order picking)
+    result_std = await tool.execute(
+        order_id="ORD-STANDARD-01",
+        is_batch_pick=False
+    )
+    assert result_std.success is True
+    std_data = result_std.data
+    assert std_data["route_metrics"]["is_batch_pick"] is False
+    assert std_data["route_metrics"]["has_sortation_wall"] is False
+
+    std_route = std_data["trips"][0]["route"]
+    std_location_codes = [s["location_code"] for s in std_route]
+    assert "SORTATION_WALL" not in std_location_codes
+    assert "PACK-STATION" in std_location_codes
+
+    # The batch route should include extra distance walking to the Put-Wall
+    # Put-Wall is at (0, 10), Pack Station at (0, 0)
+    assert data["route_metrics"]["total_distance_m"] > std_data["route_metrics"]["total_distance_m"]
+
+

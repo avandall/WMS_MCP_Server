@@ -194,6 +194,20 @@ class GrpcCoreClient:
             async with self._client.product_stub() as stub:
                 req = product_pb2.GetProductRequest(product_id=p_id)
                 prod = await stub.GetProduct(req)
+                uoms_list = []
+                case_size = 1
+                for u in getattr(prod, "uoms", []):
+                    u_code = str(getattr(u, "uom_code", "")).upper()
+                    c_factor = float(getattr(u, "conversion_factor", 1.0))
+                    to_uom = str(getattr(u, "to_uom_code", "")).upper()
+                    uoms_list.append({
+                        "uom_code": u_code,
+                        "conversion_factor": c_factor,
+                        "to_uom_code": to_uom
+                    })
+                    if u_code in ["CASE", "CS", "CARTON", "BOX"] and c_factor > 1:
+                        case_size = int(c_factor)
+
                 return {
                     "product_id": prod.product_id,
                     "sku_code": f"SKU-{prod.product_id}",
@@ -203,7 +217,10 @@ class GrpcCoreClient:
                     "width": prod.width_cm or 15.0,
                     "height": prod.height_cm or 10.0,
                     "weight": prod.gross_weight_kg or 1.5,
-                    "description": prod.description
+                    "description": prod.description,
+                    "base_uom": getattr(prod, "base_uom", "EACH"),
+                    "uoms": uoms_list,
+                    "case_size": case_size,
                 }
         except Exception as e:
             logger.error(f"Error calling GetProduct gRPC: {e}")

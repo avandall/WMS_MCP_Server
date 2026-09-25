@@ -5,6 +5,10 @@ import pytest
 from app.tools.orders.suggest_packing_box import (
     SuggestPackingBox,
     _has_sufficient_base_support,
+    calculate_center_of_gravity,
+    check_center_of_gravity,
+    adjust_placement_for_center_of_gravity,
+    partition_sioc_items,
 )
 
 
@@ -498,4 +502,257 @@ async def test_3d_bpp_packing_gravity_and_fragile_integration(mock_db_client, te
     recs = result.data["recommendations"]
     assert len(recs) == 1
     assert recs[0]["box_id"] == "BOX-STACK-VERTICAL"
+
+
+# ==============================================================================
+# TASK-067: Center of Gravity Optimization & Mass Distribution (DOM-02)
+# ==============================================================================
+
+def test_center_of_gravity_unit_functions():
+    """
+    Acceptance Criteria (TASK-067 / DOM-02):
+    1. calculate_center_of_gravity: Computes weighted CoG (X_cg, Y_cg, Z_cg).
+    2. check_center_of_gravity: Detects offset > 20% from geometric center.
+    3. adjust_placement_for_center_of_gravity: Translates placed items towards center bottom
+       to bring CoG within safe +-20% zone.
+    """
+    # Item: 20x20x20cm, 15kg placed at origin (0, 0, 0)
+    placed_boxes = [(0.0, 0.0, 0.0, 20.0, 20.0, 20.0, {"weight": 15.0})]
+    box_l, box_w, box_h = 60.0, 40.0, 35.0
+    # Geometric center: X=30.0, Y=20.0, Z=17.5
+
+    # 1. Calculate CoG
+    cog = calculate_center_of_gravity(placed_boxes, box_l, box_w, box_h)
+    assert cog == (10.0, 10.0, 10.0)
+
+    # 2. Check CoG before adjustment (offset X = |10 - 30| = 20 / 60 = 33.3% > 20%)
+    chk_before = check_center_of_gravity(placed_boxes, box_l, box_w, box_h, max_offset_ratio=0.20)
+    assert chk_before["is_balanced"] is False
+    assert chk_before["offset_x"] == 20.0
+    assert chk_before["offset_ratio_x"] == pytest.approx(0.3333, 0.001)
+
+    # 3. Adjust placement towards carton center
+    adjusted = adjust_placement_for_center_of_gravity(placed_boxes, box_l, box_w, box_h)
+    assert len(adjusted) == 1
+    new_px, new_py, new_pz = adjusted[0][0], adjusted[0][1], adjusted[0][2]
+    # To align CoG (10, 10) to (30, 20), shift is dx = +20, dy = +10
+    assert new_px == 20.0
+    assert new_py == 10.0
+    assert new_pz == 0.0
+
+    # 4. Check CoG after adjustment
+    chk_after = check_center_of_gravity(adjusted, box_l, box_w, box_h, max_offset_ratio=0.20)
+    assert chk_after["is_balanced"] is True
+    assert chk_after["center_of_gravity"] == (30.0, 20.0, 10.0)
+    assert chk_after["offset_x"] == 0.0
+    assert chk_after["offset_y"] == 0.0
+    assert chk_after["offset_ratio_x"] <= 0.20
+    assert chk_after["offset_ratio_y"] <= 0.20
+
+
+@pytest.mark.asyncio
+async def test_center_of_gravity_heavy_item_centering(mock_db_client, test_config):
+    """
+    Acceptance Criteria (TASK-067 / DOM-02):
+    Đơn hàng gồm 1 vật nặng 15kg (20x20x20) và 2 vật nhẹ 0.5kg (10x10x10):
+    Trọng tâm thùng carton đóng gói phải nằm trong vùng an toàn +- 20%.
+    """
+    order_items = [
+        {
+            "sku_code": "SKU-CAST-IRON",
+            "name": "Heavy Cast Iron Part",
+            "quantity": 1,
+            "length": 20.0,
+            "width": 20.0,
+            "height": 20.0,
+            "weight": 15.0,
+            "allow_rotation": True,
+            "category": "HARDWARE"
+        },
+        {
+            "sku_code": "SKU-FOAM-PADDING",
+            "name": "Foam Spacer",
+            "quantity": 2,
+            "length": 10.0,
+            "width": 10.0,
+            "height": 10.0,
+            "weight": 0.5,
+            "allow_rotation": True,
+            "category": "PACKING"
+        }
+    ]
+
+    candidate_boxes = [
+        {
+            "box_id": "BOX-LARGE-L",
+            "name": "Large Box (L)",
+            "length": 60.0,
+            "width": 40.0,
+            "height": 35.0,
+            "max_weight": 30.0,
+            "volume": 84000.0
+        }
+    ]
+
+    mock_db_client.fetch_many.side_effect = [
+        order_items,
+        candidate_boxes
+    ]
+
+    tool = SuggestPackingBox(test_config)
+    tool.db = mock_db_client
+
+    result = await tool.execute(order_id="ORD-HEAVY-PART-15KG")
+    assert result.success is True
+    recs = result.data["recommendations"]
+    assert len(recs) == 1
+    selected = recs[0]
+
+    # Verify CoG metrics in recommendation
+    assert selected["is_cog_balanced"] is True
+    assert selected["cog_status"] == "BALANCED"
+    assert selected["cog_offset_ratio_x"] <= 0.20
+    assert selected["cog_offset_ratio_y"] <= 0.20
+
+
+# ==============================================================================
+# TASK-068: Automatic SIOC Master Carton Recognition (DOM-03)
+# ==============================================================================
+
+@pytest.mark.asyncio
+async def test_sioc_master_carton_recognition(mock_db_client, test_config):
+    """
+    Acceptance Criteria (TASK-068 / DOM-03):
+    Đơn hàng 50 lon (1 Case = 24 lon):
+    -> 2 Thùng nguyên (48 lon): Xuất nguyên kiện SIOC (Dán nhãn vận chuyển trực tiếp)
+    -> 2 Lon lẻ: Đưa vào 3D-BPP để đóng gói vào hộp carton nhỏ
+    """
+    order_items = [
+        {
+            "sku_code": "SKU-SODA-CAN",
+            "name": "Sparkling Soda Can 330ml",
+            "quantity": 50,
+            "length": 6.0,
+            "width": 6.0,
+            "height": 12.0,
+            "weight": 0.35,
+            "case_size": 24,
+            "allow_rotation": True,
+            "category": "BEVERAGE"
+        }
+    ]
+
+    candidate_boxes = [
+        {
+            "box_id": "BOX-S",
+            "name": "Small Box (S)",
+            "length": 25.0,
+            "width": 20.0,
+            "height": 15.0,
+            "max_weight": 5.0,
+            "volume": 7500.0
+        }
+    ]
+
+    mock_db_client.fetch_many.side_effect = [
+        order_items,
+        candidate_boxes
+    ]
+
+    tool = SuggestPackingBox(test_config)
+    tool.db = mock_db_client
+
+    result = await tool.execute(order_id="ORD-SODA-50-CANS")
+    assert result.success is True
+    data = result.data
+
+    # SIOC Master Carton packages check (50 // 24 = 2 cases)
+    sioc_pkgs = data["sioc_packages"]
+    assert len(sioc_pkgs) == 2
+    for pkg in sioc_pkgs:
+        assert pkg["is_sioc"] is True
+        assert pkg["package_type"] == "SIOC"
+        assert pkg["quantity_per_case"] == 24
+        assert pkg["sku_code"] == "SKU-SODA-CAN"
+        assert "Dán nhãn vận chuyển trực tiếp" in pkg["instructions"]
+
+    # Loose items check (50 % 24 = 2 loose cans)
+    loose = data["loose_items"]
+    assert len(loose) == 1
+    assert loose[0]["sku_code"] == "SKU-SODA-CAN"
+    assert loose[0]["quantity"] == 2
+
+    # 3D-BPP recommendation for the 2 loose cans
+    recs = data["recommendations"]
+    assert len(recs) >= 1
+    assert recs[0]["box_id"] == "BOX-S"
+
+
+@pytest.mark.asyncio
+async def test_sioc_fully_master_carton_no_repack(mock_db_client, test_config):
+    """
+    Acceptance Criteria (TASK-068 / DOM-03):
+    Đơn hàng đủ thùng nguyên (48 lon = 2 Case x 24):
+    Không bị xé lẻ đóng hộp lại, không cần thùng carton phụ.
+    """
+    order_items = [
+        {
+            "sku_code": "SKU-BEER-CAN",
+            "name": "Craft Beer Can 330ml",
+            "quantity": 48,
+            "length": 6.0,
+            "width": 6.0,
+            "height": 12.0,
+            "weight": 0.35,
+            "case_size": 24,
+            "allow_rotation": True,
+            "category": "BEVERAGE"
+        }
+    ]
+
+    mock_db_client.fetch_many.side_effect = [
+        order_items,
+        []  # No candidate boxes needed because 100% SIOC
+    ]
+
+    tool = SuggestPackingBox(test_config)
+    tool.db = mock_db_client
+
+    result = await tool.execute(order_id="ORD-BEER-48-FULL")
+    assert result.success is True
+    data = result.data
+
+    assert data["is_fully_sioc"] is True
+    assert len(data["sioc_packages"]) == 2
+    assert len(data["loose_items"]) == 0
+    assert len(data["recommendations"]) == 0
+    assert data["selected_recommendation"]["package_type"] == "SIOC"
+    assert "Toàn bộ đơn hàng" in data["selected_recommendation"]["message"]
+
+
+def test_sioc_partition_via_uom_conversion():
+    """Test partition_sioc_items using product UOM conversion factors."""
+    items = [
+        {
+            "sku_code": "SKU-COKE-UOM",
+            "name": "Coca Cola 330ml",
+            "quantity": 25,
+            "length": 6.0,
+            "width": 6.0,
+            "height": 12.0,
+            "weight": 0.35,
+            "uoms": [
+                {"uom_code": "CASE", "conversion_factor": 12.0, "to_uom_code": "EACH"}
+            ]
+        }
+    ]
+
+    sioc_pkgs, loose = partition_sioc_items(items)
+    # 25 // 12 = 2 cases (24 units), 1 loose unit
+    assert len(sioc_pkgs) == 2
+    assert sioc_pkgs[0]["quantity_per_case"] == 12
+    assert sioc_pkgs[1]["quantity_per_case"] == 12
+    assert len(loose) == 1
+    assert loose[0]["quantity"] == 1
+
 

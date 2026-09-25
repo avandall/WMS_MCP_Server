@@ -19,6 +19,22 @@ class GeneratePickingRouteInput(BaseModel):
     aisle_length_y: float = Field(default=50.0, description="Aisle length in meters along Y axis (default 50m)")
     cross_aisle_front_y: float = Field(default=0.0, description="Front cross-aisle Y coordinate")
     cross_aisle_back_y: float = Field(default=50.0, description="Back cross-aisle Y coordinate")
+    enforce_one_way: bool = Field(
+        default=True,
+        description="Enforce one-way aisle traffic rule (Odd aisles: Y ASC Front->Back, Even aisles: Y DESC Back->Front) (TASK-066 / DOM-01)"
+    )
+    is_batch_pick: bool = Field(
+        default=False,
+        description="Flag indicating whether this order is a batch picking wave requiring Put-Wall sortation (TASK-069 / DOM-04)"
+    )
+    sortation_wall_x: float = Field(
+        default=0.0,
+        description="X coordinate of Put-Wall sortation station"
+    )
+    sortation_wall_y: float = Field(
+        default=10.0,
+        description="Y coordinate of Put-Wall sortation station"
+    )
 
 
 class GeneratePickingRoute(BaseTool):
@@ -53,6 +69,26 @@ class GeneratePickingRoute(BaseTool):
                     "enum": ["aisle_graph", "euclidean"],
                     "description": "Routing algorithm mode",
                     "default": "aisle_graph"
+                },
+                "enforce_one_way": {
+                    "type": "boolean",
+                    "description": "Enforce one-way aisle traffic rule (Odd aisles: Y ASC Front->Back, Even aisles: Y DESC Back->Front)",
+                    "default": True
+                },
+                "is_batch_pick": {
+                    "type": "boolean",
+                    "description": "Flag indicating whether this order is a batch picking wave requiring Put-Wall sortation",
+                    "default": False
+                },
+                "sortation_wall_x": {
+                    "type": "number",
+                    "description": "X coordinate of Put-Wall sortation station",
+                    "default": 0.0
+                },
+                "sortation_wall_y": {
+                    "type": "number",
+                    "description": "Y coordinate of Put-Wall sortation station",
+                    "default": 10.0
                 }
             },
             "required": ["order_id"]
@@ -139,7 +175,11 @@ class GeneratePickingRoute(BaseTool):
                     trip_items=trip_items,
                     aisle_length_y=input_data.aisle_length_y,
                     cross_front_y=input_data.cross_aisle_front_y,
-                    cross_back_y=input_data.cross_aisle_back_y
+                    cross_back_y=input_data.cross_aisle_back_y,
+                    enforce_one_way=input_data.enforce_one_way,
+                    is_batch_pick=input_data.is_batch_pick,
+                    sortation_wall_x=input_data.sortation_wall_x,
+                    sortation_wall_y=input_data.sortation_wall_y,
                 )
                 
                 trip_weight = sum(item["total_weight_kg"] for item in trip_items)
@@ -155,7 +195,7 @@ class GeneratePickingRoute(BaseTool):
                 }
                 trip_results.append(trip_data)
                 
-                # Exclude DEPOT and PACK-STATION from purely unique item stops in optimized_route
+                # Exclude DEPOT, SORTATION_WALL and PACK-STATION from purely unique item stops in optimized_route
                 for st in trip_route:
                     if st.get("type") == "PICK":
                         all_stops_flattened.append(st)
@@ -172,6 +212,9 @@ class GeneratePickingRoute(BaseTool):
                 "total_trips": len(trips),
                 "multi_trip_required": len(trips) > 1,
                 "cart_capacity_kg": input_data.max_cart_capacity_kg,
+                "enforce_one_way": input_data.enforce_one_way,
+                "is_batch_pick": input_data.is_batch_pick,
+                "has_sortation_wall": input_data.is_batch_pick,
                 "routing_algorithm": "S-Shape (Serpentine) Heuristic on Aisle Graph"
             }
             
@@ -258,16 +301,47 @@ class GeneratePickingRoute(BaseTool):
             
         return trips if trips else [items]
         
+    @staticmethod
+    def _determine_aisle_number(picks: List[Dict[str, Any]], aisle_idx: int, aisle_x: float) -> int:
+        """
+        Determines the physical aisle number (1-indexed) for One-Way Aisle Rules (TASK-066 / DOM-01).
+        Checks explicit aisle/location code, falls back to spacing or sorted index.
+        """
+        import re
+        for p in picks:
+            for field in ["aisle", "row_id", "location_code"]:
+                val = str(p.get(field, "") or "")
+                m = re.search(r'(?:AISLE|ROW)[_-]?0*(\d+)', val, re.IGNORECASE)
+                if m:
+                    return int(m.group(1))
+                m2 = re.search(r'[-_]A0*(\d+)[-_]', val, re.IGNORECASE)
+                if m2:
+                    return int(m2.group(1))
+
+        if aisle_x > 0:
+            estimated = round(aisle_x / 3.0)
+            if abs(aisle_x - estimated * 3.0) < 0.2 and estimated >= 1:
+                return int(estimated)
+
+        return aisle_idx + 1
+
     def _build_s_shape_trip(
         self,
         trip_items: List[Dict[str, Any]],
         aisle_length_y: float = 50.0,
         cross_front_y: float = 0.0,
-        cross_back_y: float = 50.0
+        cross_back_y: float = 50.0,
+        enforce_one_way: bool = True,
+        is_batch_pick: bool = False,
+        sortation_wall_x: float = 0.0,
+        sortation_wall_y: float = 10.0,
     ) -> Tuple[List[Dict[str, Any]], float]:
         """
         Build an S-Shape (Serpentine) picking route for a trip:
         Depot (0, 0) -> S-Shape traversal of aisles with picks -> Pack Station (0, 0).
+        When enforce_one_way=True, strictly enforces:
+          - Odd aisles (1, 3, ...): Y ASCENDING (Front -> Back)
+          - Even aisles (2, 4, ...): Y DESCENDING (Back -> Front)
         Returns: (route_stops, total_distance)
         """
         # Group unique pick locations by aisle (keyed by X coordinate)
@@ -278,6 +352,7 @@ class GeneratePickingRoute(BaseTool):
                 loc_map[code] = {
                     "location_code": code,
                     "zone_id": it.get("zone_id", "ZONE-A"),
+                    "aisle": it.get("aisle", ""),
                     "row_id": it.get("row_id", ""),
                     "shelf_id": it.get("shelf_id", ""),
                     "x": float(it.get("x_coordinate", 0.0)),
@@ -320,17 +395,28 @@ class GeneratePickingRoute(BaseTool):
             picks_in_aisle = aisle_dict[aisle_x]
             is_last_aisle = (i == len(sorted_aisles) - 1)
             
-            # Determine entry cross-aisle: if curr_y near front, enter from front; if near back, enter from back
-            at_front = abs(curr_y - cross_front_y) <= abs(curr_y - cross_back_y)
-            
-            # Walk along cross-aisle to the current aisle
-            cross_travel = abs(aisle_x - curr_x)
-            total_distance += cross_travel
-            curr_x = aisle_x
-            
-            if at_front:
-                # Moving forward: sort picks by Y ASC
-                sorted_picks = sorted(picks_in_aisle, key=lambda p: p["y"])
+            if enforce_one_way:
+                aisle_num = self._determine_aisle_number(picks_in_aisle, i, aisle_x)
+                is_odd_aisle = (aisle_num % 2 != 0)
+
+                if is_odd_aisle:
+                    # Odd Aisle (Dãy lẻ): Traffic MUST flow Front -> Back (Y ASCENDING: Y1 <= Y2 <= ...)
+                    sorted_picks = sorted(picks_in_aisle, key=lambda p: p["y"])
+                    target_entry_y = cross_front_y
+                    target_exit_y = cross_back_y
+                else:
+                    # Even Aisle (Dãy chẵn): Traffic MUST flow Back -> Front (Y DESCENDING: Y1 >= Y2 >= ...)
+                    sorted_picks = sorted(picks_in_aisle, key=lambda p: p["y"], reverse=True)
+                    target_entry_y = cross_back_y
+                    target_exit_y = cross_front_y
+
+                # Walk along cross-aisle or perimeter to enter at target_entry_y
+                cross_travel = abs(aisle_x - curr_x) + abs(curr_y - target_entry_y)
+                total_distance += cross_travel
+                curr_x = aisle_x
+                curr_y = target_entry_y
+
+                # Pick items along the mandatory one-way direction
                 for p in sorted_picks:
                     dist_to_pick = abs(p["y"] - curr_y)
                     total_distance += dist_to_pick
@@ -339,14 +425,14 @@ class GeneratePickingRoute(BaseTool):
                     p_copy["stop_number"] = stop_counter
                     stop_counter += 1
                     route.append(p_copy)
-                
-                # If not last aisle, traverse through to back cross-aisle
+
+                # Exit the aisle in the mandatory direction
                 if not is_last_aisle:
-                    dist_to_exit = abs(cross_back_y - curr_y)
+                    dist_to_exit = abs(target_exit_y - curr_y)
                     total_distance += dist_to_exit
-                    curr_y = cross_back_y
+                    curr_y = target_exit_y
                 else:
-                    # Last aisle: return to nearest cross-aisle to reach pack station
+                    # Last aisle: proceed to nearest cross-aisle to reach pack station
                     dist_to_front = abs(curr_y - cross_front_y)
                     dist_to_back = abs(cross_back_y - curr_y)
                     if dist_to_front <= dist_to_back:
@@ -356,36 +442,93 @@ class GeneratePickingRoute(BaseTool):
                         total_distance += dist_to_back
                         curr_y = cross_back_y
             else:
-                # Moving backward: sort picks by Y DESC
-                sorted_picks = sorted(picks_in_aisle, key=lambda p: p["y"], reverse=True)
-                for p in sorted_picks:
-                    dist_to_pick = abs(curr_y - p["y"])
-                    total_distance += dist_to_pick
-                    curr_y = p["y"]
-                    p_copy = p.copy()
-                    p_copy["stop_number"] = stop_counter
-                    stop_counter += 1
-                    route.append(p_copy)
+                # Determine entry cross-aisle: if curr_y near front, enter from front; if near back, enter from back
+                at_front = abs(curr_y - cross_front_y) <= abs(curr_y - cross_back_y)
+                
+                # Walk along cross-aisle to the current aisle
+                cross_travel = abs(aisle_x - curr_x)
+                total_distance += cross_travel
+                curr_x = aisle_x
+                
+                if at_front:
+                    # Moving forward: sort picks by Y ASC
+                    sorted_picks = sorted(picks_in_aisle, key=lambda p: p["y"])
+                    for p in sorted_picks:
+                        dist_to_pick = abs(p["y"] - curr_y)
+                        total_distance += dist_to_pick
+                        curr_y = p["y"]
+                        p_copy = p.copy()
+                        p_copy["stop_number"] = stop_counter
+                        stop_counter += 1
+                        route.append(p_copy)
                     
-                # If not last aisle, traverse through to front cross-aisle
-                if not is_last_aisle:
-                    dist_to_exit = abs(curr_y - cross_front_y)
-                    total_distance += dist_to_exit
-                    curr_y = cross_front_y
+                    # If not last aisle, traverse through to back cross-aisle
+                    if not is_last_aisle:
+                        dist_to_exit = abs(cross_back_y - curr_y)
+                        total_distance += dist_to_exit
+                        curr_y = cross_back_y
+                    else:
+                        # Last aisle: return to nearest cross-aisle to reach pack station
+                        dist_to_front = abs(curr_y - cross_front_y)
+                        dist_to_back = abs(cross_back_y - curr_y)
+                        if dist_to_front <= dist_to_back:
+                            total_distance += dist_to_front
+                            curr_y = cross_front_y
+                        else:
+                            total_distance += dist_to_back
+                            curr_y = cross_back_y
                 else:
-                    # Last aisle: return to nearest cross-aisle
-                    dist_to_front = abs(curr_y - cross_front_y)
-                    dist_to_back = abs(cross_back_y - curr_y)
-                    if dist_to_front <= dist_to_back:
-                        total_distance += dist_to_front
+                    # Moving backward: sort picks by Y DESC
+                    sorted_picks = sorted(picks_in_aisle, key=lambda p: p["y"], reverse=True)
+                    for p in sorted_picks:
+                        dist_to_pick = abs(curr_y - p["y"])
+                        total_distance += dist_to_pick
+                        curr_y = p["y"]
+                        p_copy = p.copy()
+                        p_copy["stop_number"] = stop_counter
+                        stop_counter += 1
+                        route.append(p_copy)
+                        
+                    # If not last aisle, traverse through to front cross-aisle
+                    if not is_last_aisle:
+                        dist_to_exit = abs(curr_y - cross_front_y)
+                        total_distance += dist_to_exit
                         curr_y = cross_front_y
                     else:
-                        total_distance += dist_to_back
-                        curr_y = cross_back_y
+                        # Last aisle: return to nearest cross-aisle
+                        dist_to_front = abs(curr_y - cross_front_y)
+                        dist_to_back = abs(cross_back_y - curr_y)
+                        if dist_to_front <= dist_to_back:
+                            total_distance += dist_to_front
+                            curr_y = cross_front_y
+                        else:
+                            total_distance += dist_to_back
+                            curr_y = cross_back_y
         
         # Conclude at Pack Station (at 0, cross_front_y)
         pack_station_x = 0.0
         pack_station_y = cross_front_y
+        
+        # If batch picking wave: route via SORTATION_WALL before final PACK-STATION (TASK-069 / DOM-04)
+        if is_batch_pick:
+            dist_to_sortation = abs(curr_x - sortation_wall_x) + abs(curr_y - sortation_wall_y)
+            total_distance += dist_to_sortation
+            curr_x = sortation_wall_x
+            curr_y = sortation_wall_y
+            
+            sort_stop = {
+                "stop_number": stop_counter,
+                "location_code": "SORTATION_WALL",
+                "zone_id": "SORTATION",
+                "type": "SORTATION_WALL",
+                "x": sortation_wall_x,
+                "y": sortation_wall_y,
+                "z": 0.0,
+                "instruction": "Deliver batch-picked cart to Put-Wall for item scan & individual order sorting."
+            }
+            route.append(sort_stop)
+            stop_counter += 1
+
         final_corridor_dist = abs(curr_x - pack_station_x) + abs(curr_y - pack_station_y)
         total_distance += final_corridor_dist
         
