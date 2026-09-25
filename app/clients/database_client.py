@@ -159,67 +159,37 @@ class DatabaseClient:
         user_id: str = "mcp-agent"
     ) -> bool:
         """
-        Type-safe stock movement between warehouse locations.
-        Executes outbound deduction from source and inbound addition to destination.
+        TASK-076 / DOM-01: Atomic stock movement between warehouse locations using MoveLocationStock gRPC.
+        Eliminates two-phase split-brain risk and updates inventory_locations synchronously with dual row-lock.
         """
         if self._is_mocked("move_inventory_stock"):
             return True
         import uuid
-        import re
         from app.gen.wms.inventory.v1 import inventory_pb2
         from app.integration.grpc_client import grpc_client
         from app.exceptions import UpstreamServiceUnavailableError
 
         product_id = await self.resolve_product_id(sku_code)
-        
-        from_digits = re.findall(r'\d+', str(from_location))
-        to_digits = re.findall(r'\d+', str(to_location))
-        from_wh = warehouse_id or (int(from_digits[0]) if from_digits else 1)
-        to_wh = warehouse_id or (int(to_digits[0]) if to_digits else 1)
+        wh_id = warehouse_id or 1
 
         try:
             async with grpc_client.inventory_stub() as stub:
-                # Step 1: Deduct from source location/warehouse
-                out_req = inventory_pb2.ConfirmInventoryTransactionRequest(
-                    transaction_type="ADJUSTMENT_OUT",
+                req = inventory_pb2.MoveLocationStockRequest(
                     product_id=product_id,
-                    warehouse_id=from_wh,
+                    sku_code=sku_code,
+                    warehouse_id=wh_id,
+                    from_location_code=from_location,
+                    to_location_code=to_location,
                     quantity=abs(quantity),
                     user_id=user_id,
-                    idempotency_key=f"move_out_{uuid.uuid4().hex[:12]}"
+                    idempotency_key=f"move_{uuid.uuid4().hex[:12]}"
                 )
-                out_res = await stub.ConfirmInventoryTransaction(out_req)
-                if not out_res.success:
-                    return False
-
-                # Step 2: Add to destination location/warehouse
-                in_req = inventory_pb2.ConfirmInventoryTransactionRequest(
-                    transaction_type="ADJUSTMENT_IN",
-                    product_id=product_id,
-                    warehouse_id=to_wh,
-                    quantity=abs(quantity),
-                    user_id=user_id,
-                    idempotency_key=f"move_in_{uuid.uuid4().hex[:12]}"
-                )
-                in_res = await stub.ConfirmInventoryTransaction(in_req)
-                if not in_res.success:
-                    # Compensation: rollback source deduction
-                    compensate_req = inventory_pb2.ConfirmInventoryTransactionRequest(
-                        transaction_type="ADJUSTMENT_IN",
-                        product_id=product_id,
-                        warehouse_id=from_wh,
-                        quantity=abs(quantity),
-                        user_id=user_id,
-                        idempotency_key=f"move_comp_{uuid.uuid4().hex[:12]}"
-                    )
-                    await stub.ConfirmInventoryTransaction(compensate_req)
-                    return False
-
-                return True
+                res = await stub.MoveLocationStock(req)
+                return bool(res.success)
         except UpstreamServiceUnavailableError:
             raise
         except Exception as e:
-            logger.error(f"Failed to move inventory stock via gRPC: {e}")
+            logger.error(f"Failed to move inventory stock via gRPC MoveLocationStock: {e}")
             raise UpstreamServiceUnavailableError(f"WMS Core Inventory Service unavailable: {e}") from e
 
     async def update_stock_quantity(

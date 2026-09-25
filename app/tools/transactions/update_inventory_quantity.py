@@ -1,6 +1,5 @@
 """Update inventory quantity tool"""
 
-import re
 import uuid
 from typing import Dict, Any, Literal
 from pydantic import BaseModel, Field
@@ -22,16 +21,17 @@ from app.gen.wms.product.v1 import product_pb2
 class UpdateInventoryQuantityInput(BaseModel):
     """Input schema for update_inventory_quantity"""
     sku_code: str = Field(..., description="SKU code or Product ID")
-    location_code: str = Field(..., description="Location code or Warehouse ID")
+    location_code: str = Field(..., description="Location code (e.g. AISLE-12-BAY-03)")
     action: Literal["INCREASE", "DECREASE"] = Field(..., description="Action: INCREASE or DECREASE")
     quantity: int = Field(..., description="Quantity to increase/decrease")
+    warehouse_id: int = Field(1, description="Warehouse ID")
 
 
 class UpdateInventoryQuantity(BaseTool):
-    """Update inventory quantity at a specific location"""
+    """Update inventory quantity at a specific location via Draft Proposal"""
     
     name = "update_inventory_quantity"
-    description = "Increase or decrease inventory quantity at a specific warehouse/location via core services"
+    description = "Create a draft proposal to increase or decrease inventory quantity at a warehouse location (requires manager approval)"
     
     def __init__(self, config):
         super().__init__(config)
@@ -48,7 +48,7 @@ class UpdateInventoryQuantity(BaseTool):
                 },
                 "location_code": {
                     "type": "string",
-                    "description": "Location code or Warehouse ID (e.g., WH-1 or 1)"
+                    "description": "Location code (e.g. AISLE-12-BAY-03)"
                 },
                 "action": {
                     "type": "string",
@@ -58,6 +58,11 @@ class UpdateInventoryQuantity(BaseTool):
                 "quantity": {
                     "type": "integer",
                     "description": "Quantity to increase/decrease (must be positive)"
+                },
+                "warehouse_id": {
+                    "type": "integer",
+                    "description": "Warehouse ID",
+                    "default": 1
                 }
             },
             "required": ["sku_code", "location_code", "action", "quantity"]
@@ -96,29 +101,25 @@ class UpdateInventoryQuantity(BaseTool):
                     error_code="LOCK_ACQUISITION_FAILED"
                 )
             
-            # Resolve product_id and warehouse_id
+            # Resolve product_id and explicit warehouse_id
             product_id = await self._resolve_product_id(input_data.sku_code)
-            
-            # Extract warehouse_id from location_code string
-            warehouse_id = 1
-            digits = re.findall(r'\d+', input_data.location_code)
-            if digits:
-                warehouse_id = int(digits[0])
+            warehouse_id = input_data.warehouse_id
                 
-            # Determine transaction type
-            tx_type = "ADJUSTMENT_IN" if input_data.action == "INCREASE" else "ADJUSTMENT_OUT"
+            # Calculate adjustment (+qty for INCREASE, -qty for DECREASE)
+            adjustment = input_data.quantity if input_data.action == "INCREASE" else -input_data.quantity
             
-            # Call WMS Core inventory-service via gRPC ConfirmInventoryTransaction
+            # Call WMS Core inventory-service via gRPC CreateDraftProposal (Maker-Checker compliance)
             async with grpc_client.inventory_stub() as stub:
-                request = inventory_pb2.ConfirmInventoryTransactionRequest(
-                    transaction_type=tx_type,
-                    product_id=product_id,
+                request = inventory_pb2.CreateDraftProposalRequest(
+                    proposal_type="QUANTITY_UPDATE",
+                    sku_code=input_data.sku_code,
                     warehouse_id=warehouse_id,
-                    quantity=input_data.quantity,
-                    user_id="mcp-agent",
-                    idempotency_key=f"confirm_{uuid.uuid4().hex[:12]}"
+                    location_code=input_data.location_code,
+                    adjustment=adjustment,
+                    reason=f"AI Agent quantity update: {input_data.action} {input_data.quantity}",
+                    requested_by="mcp-agent"
                 )
-                response = await stub.ConfirmInventoryTransaction(request)
+                response = await stub.CreateDraftProposal(request)
                 success = response.success
             
             # Release lock
@@ -130,24 +131,30 @@ class UpdateInventoryQuantity(BaseTool):
             if not success:
                 return ToolResult(
                     success=False,
-                    error="Failed to update inventory quantity via WMS Core service",
-                    error_code="UPDATE_FAILED"
+                    error=response.message or "Failed to create draft proposal via WMS Core service",
+                    error_code="PROPOSAL_CREATION_FAILED"
                 )
             
             # Invalidate cache
             await self.redis.cache_delete(f"stock:{input_data.sku_code}")
             
+            proposal = response.proposal
+            proposal_id = getattr(proposal, "proposal_id", "") if proposal else ""
+            status = getattr(proposal, "status", "DRAFT_PROPOSAL") if proposal else "DRAFT_PROPOSAL"
+            
             return ToolResult(
                 success=True,
                 data={
+                    "proposal_id": proposal_id,
                     "sku_code": input_data.sku_code,
                     "product_id": product_id,
                     "warehouse_id": warehouse_id,
                     "location_code": input_data.location_code,
                     "action": input_data.action,
                     "quantity": input_data.quantity,
-                    "transaction_id": response.transaction_id,
-                    "message": f"Successfully {input_data.action.lower()}d inventory by {input_data.quantity} via Core gRPC service"
+                    "adjustment": adjustment,
+                    "status": status,
+                    "message": f"Draft proposal {proposal_id} created successfully with status {status}. Awaiting manager approval."
                 }
             )
             

@@ -396,6 +396,63 @@ class GrpcCoreClient:
             logger.error(f"Error getting low stock report via gRPC: {e}")
             raise UpstreamServiceUnavailableError(f"WMS Core Reporting Service unavailable: {e}") from e
 
+    async def create_draft_proposal(
+        self,
+        sku_code: str,
+        warehouse_id: int,
+        location_code: str,
+        adjustment: int,
+        reason: str,
+        proposal_type: str = "QUANTITY_ADJUSTMENT",
+        requested_by: str = "mcp-agent",
+        current_quantity: int = 0,
+        proposed_quantity: int = 0,
+        position_id: int = 0,
+        digital_signature: str = ""
+    ) -> Dict[str, Any]:
+        """Create a draft inventory proposal via inventory-service gRPC (Maker-Checker workflow)"""
+        try:
+            async with self._client.inventory_stub() as stub:
+                req = inventory_pb2.CreateDraftProposalRequest(
+                    proposal_type=proposal_type,
+                    sku_code=sku_code,
+                    warehouse_id=warehouse_id,
+                    location_code=location_code,
+                    position_id=position_id,
+                    current_quantity=current_quantity,
+                    proposed_quantity=proposed_quantity,
+                    adjustment=adjustment,
+                    reason=reason,
+                    requested_by=requested_by,
+                    digital_signature=digital_signature,
+                )
+                res = await stub.CreateDraftProposal(req)
+                if not res.success:
+                    raise ValueError(res.message or "Failed to create draft proposal")
+                
+                prop = res.proposal
+                return {
+                    "proposal_id": prop.proposal_id,
+                    "proposal_type": prop.proposal_type,
+                    "sku_code": prop.sku_code,
+                    "warehouse_id": prop.warehouse_id,
+                    "location_code": prop.location_code,
+                    "position_id": prop.position_id,
+                    "current_quantity": prop.current_quantity,
+                    "proposed_quantity": prop.proposed_quantity,
+                    "adjustment": prop.adjustment,
+                    "status": prop.status,
+                    "reason": prop.reason,
+                    "requested_by": prop.requested_by,
+                    "created_at": prop.created_at,
+                    "message": res.message
+                }
+        except UpstreamServiceUnavailableError:
+            raise
+        except Exception as e:
+            logger.error(f"Error calling CreateDraftProposal gRPC: {e}")
+            raise UpstreamServiceUnavailableError(f"WMS Core Inventory Service unavailable: {e}") from e
+
     async def fetch_one(self, query: str, *args, **kwargs) -> Optional[Dict[str, Any]]:
         """Mock/fallback compatibility shim for legacy database calls"""
         return None

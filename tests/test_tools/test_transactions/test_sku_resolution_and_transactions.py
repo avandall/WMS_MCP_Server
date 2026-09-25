@@ -86,7 +86,7 @@ async def test_confirm_inventory_adjustment_type_safe(mock_product_catalog, mock
 
 @pytest.mark.asyncio
 async def test_move_inventory_stock_type_safe(mock_product_catalog, mock_grpc_client, test_config):
-    """Verify DatabaseClient.move_inventory_stock executes two-phase stock transfer"""
+    """Verify DatabaseClient.move_inventory_stock executes atomic MoveLocationStock transfer"""
     db_client = DatabaseClient(test_config)
 
     success = await db_client.move_inventory_stock(
@@ -97,22 +97,15 @@ async def test_move_inventory_stock_type_safe(mock_product_catalog, mock_grpc_cl
     )
 
     assert success is True
-    assert mock_grpc_client.mock_inventory.ConfirmInventoryTransaction.call_count >= 2
+    assert mock_grpc_client.mock_inventory.MoveLocationStock.called
     
-    # Inspect outbound and inbound requests
-    calls = mock_grpc_client.mock_inventory.ConfirmInventoryTransaction.call_args_list
-    outbound_req = calls[-2][0][0]
-    inbound_req = calls[-1][0][0]
-
-    assert outbound_req.product_id == 101
-    assert outbound_req.transaction_type == "ADJUSTMENT_OUT"
-    assert outbound_req.quantity == 3
-    assert outbound_req.warehouse_id == 1
-
-    assert inbound_req.product_id == 101
-    assert inbound_req.transaction_type == "ADJUSTMENT_IN"
-    assert inbound_req.quantity == 3
-    assert inbound_req.warehouse_id == 2
+    # Inspect atomic move request
+    req = mock_grpc_client.mock_inventory.MoveLocationStock.call_args[0][0]
+    assert req.product_id == 101
+    assert req.sku_code == "FURN-CHAIR"
+    assert req.quantity == 3
+    assert req.from_location_code == "ZONE-1-SHELF-A"
+    assert req.to_location_code == "ZONE-2-SHELF-B"
 
 
 @pytest.mark.asyncio

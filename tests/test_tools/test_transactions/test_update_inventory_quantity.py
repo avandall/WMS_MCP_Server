@@ -29,7 +29,8 @@ async def test_update_inventory_quantity_increase(mock_grpc_client, mock_redis_c
     assert result.success == True
     assert result.data["action"] == "INCREASE"
     assert result.data["quantity"] == 50
-    assert mock_grpc_client.mock_inventory.ConfirmInventoryTransaction.called
+    assert result.data["status"] == "DRAFT_PROPOSAL"
+    assert mock_grpc_client.mock_inventory.CreateDraftProposal.called
     assert mock_redis_client.acquire_lock.called
     assert mock_redis_client.release_lock.called
 
@@ -58,7 +59,8 @@ async def test_update_inventory_quantity_decrease(mock_grpc_client, mock_redis_c
     assert result.success == True
     assert result.data["action"] == "DECREASE"
     assert result.data["quantity"] == 30
-    assert mock_grpc_client.mock_inventory.ConfirmInventoryTransaction.called
+    assert result.data["status"] == "DRAFT_PROPOSAL"
+    assert mock_grpc_client.mock_inventory.CreateDraftProposal.called
 
 
 @pytest.mark.asyncio
@@ -136,6 +138,16 @@ async def test_update_inventory_quantity_input_validation():
     assert valid_input.sku_code == "SKU-TEST-001"
     assert valid_input.action == "INCREASE"
     assert valid_input.quantity == 50
+    assert valid_input.warehouse_id == 1
+
+    custom_wh_input = UpdateInventoryQuantityInput(
+        sku_code="SKU-TEST-001",
+        location_code="ZONE-B-ROW-02",
+        action="DECREASE",
+        quantity=10,
+        warehouse_id=3
+    )
+    assert custom_wh_input.warehouse_id == 3
     
     # Invalid action
     with pytest.raises(Exception):

@@ -1,6 +1,5 @@
 """Adjust inventory for reason tool"""
 
-import re
 import uuid
 from typing import Dict, Any
 from pydantic import BaseModel, Field
@@ -21,16 +20,17 @@ from app.gen.wms.product.v1 import product_pb2
 class AdjustInventoryForReasonInput(BaseModel):
     """Input schema for adjust_inventory_for_reason"""
     sku_code: str = Field(..., description="SKU code or Product ID")
-    location_code: str = Field(..., description="Location code or Warehouse ID")
+    location_code: str = Field(..., description="Location code (e.g. AISLE-12-BAY-03)")
     reason: str = Field(..., description="Reason for adjustment (DAMAGED, LOST, FOUND, etc.)")
     quantity: int = Field(..., description="Quantity adjustment (can be positive or negative)")
+    warehouse_id: int = Field(1, description="Warehouse ID")
 
 
 class AdjustInventoryForReason(BaseTool):
-    """Adjust inventory for specific reasons (stock adjustment)"""
+    """Adjust inventory for specific reasons via Draft Proposal"""
     
     name = "adjust_inventory_for_reason"
-    description = "Adjust inventory quantity for reasons like damage, loss, or discovery via core services"
+    description = "Create a draft proposal to adjust inventory for reasons like damage, loss, or discovery (requires manager approval)"
     
     def __init__(self, config):
         super().__init__(config)
@@ -47,7 +47,7 @@ class AdjustInventoryForReason(BaseTool):
                 },
                 "location_code": {
                     "type": "string",
-                    "description": "Location code or Warehouse ID"
+                    "description": "Location code (e.g. AISLE-12-BAY-03)"
                 },
                 "reason": {
                     "type": "string",
@@ -56,6 +56,11 @@ class AdjustInventoryForReason(BaseTool):
                 "quantity": {
                     "type": "integer",
                     "description": "Quantity adjustment (positive for increase, negative for decrease)"
+                },
+                "warehouse_id": {
+                    "type": "integer",
+                    "description": "Warehouse ID",
+                    "default": 1
                 }
             },
             "required": ["sku_code", "location_code", "reason", "quantity"]
@@ -101,29 +106,22 @@ class AdjustInventoryForReason(BaseTool):
                     error_code="LOCK_ACQUISITION_FAILED"
                 )
             
-            # Resolve IDs
+            # Resolve IDs and explicit warehouse_id
             product_id = await self._resolve_product_id(input_data.sku_code)
+            warehouse_id = input_data.warehouse_id
             
-            warehouse_id = 1
-            digits = re.findall(r'\d+', input_data.location_code)
-            if digits:
-                warehouse_id = int(digits[0])
-                
-            # Determine direct transaction type based on sign of quantity
-            tx_type = "ADJUSTMENT_IN" if input_data.quantity > 0 else "ADJUSTMENT_OUT"
-            abs_qty = abs(input_data.quantity)
-            
-            # Call WMS Core inventory-service ConfirmInventoryTransaction gRPC
+            # Call WMS Core inventory-service CreateDraftProposal gRPC (Maker-Checker compliance)
             async with grpc_client.inventory_stub() as stub:
-                request = inventory_pb2.ConfirmInventoryTransactionRequest(
-                    transaction_type=tx_type,
-                    product_id=product_id,
+                request = inventory_pb2.CreateDraftProposalRequest(
+                    proposal_type="REASON_ADJUSTMENT",
+                    sku_code=input_data.sku_code,
                     warehouse_id=warehouse_id,
-                    quantity=abs_qty,
-                    user_id="mcp-agent",
-                    idempotency_key=f"confirm_adj_{uuid.uuid4().hex[:12]}"
+                    location_code=input_data.location_code,
+                    adjustment=input_data.quantity,
+                    reason=input_data.reason,
+                    requested_by="mcp-agent"
                 )
-                response = await stub.ConfirmInventoryTransaction(request)
+                response = await stub.CreateDraftProposal(request)
                 success = response.success
             
             # Release lock
@@ -135,24 +133,30 @@ class AdjustInventoryForReason(BaseTool):
             if not success:
                 return ToolResult(
                     success=False,
-                    error="Failed to complete inventory adjustment via WMS Core service",
-                    error_code="ADJUSTMENT_FAILED"
+                    error=response.message or "Failed to create draft proposal via WMS Core service",
+                    error_code="PROPOSAL_CREATION_FAILED"
                 )
             
             # Invalidate cache
             await self.redis.cache_delete(f"stock:{input_data.sku_code}")
             
+            proposal = response.proposal
+            proposal_id = getattr(proposal, "proposal_id", "") if proposal else ""
+            status = getattr(proposal, "status", "DRAFT_PROPOSAL") if proposal else "DRAFT_PROPOSAL"
+            
             return ToolResult(
                 success=True,
                 data={
+                    "proposal_id": proposal_id,
                     "sku_code": input_data.sku_code,
                     "product_id": product_id,
                     "warehouse_id": warehouse_id,
                     "location_code": input_data.location_code,
                     "reason": input_data.reason,
                     "quantity": input_data.quantity,
-                    "transaction_id": response.transaction_id,
-                    "message": f"Successfully adjusted inventory by {input_data.quantity} for reason: {input_data.reason} via Core gRPC service"
+                    "adjustment": input_data.quantity,
+                    "status": status,
+                    "message": f"Draft proposal {proposal_id} created successfully with status {status} for reason: {input_data.reason}. Awaiting manager approval."
                 }
             )
             

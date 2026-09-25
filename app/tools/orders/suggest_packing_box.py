@@ -13,6 +13,11 @@ from app.utils.validators import validate_order_id
 logger = logging.getLogger(__name__)
 
 
+# Safety threshold limits for SIOC parcel handling (TASK-078 / DOM-03 / OH&S)
+MAX_SIOC_WEIGHT_KG: float = 32.0
+MAX_SIOC_DIMENSION_CM: float = 150.0
+
+
 class SuggestPackingBoxInput(BaseModel):
     """Input schema for suggest_packing_box"""
     order_id: str = Field(..., description="Order ID")
@@ -156,9 +161,14 @@ class SuggestPackingBox(BaseTool):
                         "total_weight_kg": round(total_sioc_weight, 2),
                         "recommendations": [],
                         "selected_recommendation": {
-                            "package_type": "SIOC",
-                            "message": f"Toàn bộ đơn hàng ({len(sioc_packages)} kiện) xuất nguyên thùng SIOC. Không xé lẻ đóng hộp lại.",
-                            "total_sioc_packages": len(sioc_packages)
+                            "package_type": "FREIGHT_PALLET" if any(p.get("requires_freight_pallet") for p in sioc_packages) else "SIOC",
+                            "message": (
+                                f"Đơn hàng gồm kiện hàng vượt ngưỡng an toàn OH&S yêu cầu vận chuyển pallet "
+                                f"({sum(1 for p in sioc_packages if p.get('requires_freight_pallet'))} kiện FREIGHT_PALLET)."
+                                if any(p.get("requires_freight_pallet") for p in sioc_packages)
+                                else f"Toàn bộ đơn hàng ({len(sioc_packages)} kiện) xuất nguyên thùng SIOC. Không xé lẻ đóng hộp lại."
+                            ),
+                            "total_sioc_packages": len(sioc_packages),
                         }
                     }
                 )
@@ -853,28 +863,65 @@ def partition_sioc_items(
                     case_size = int(c_factor)
                     break
         
-        # Check if eligible for SIOC (has valid case packaging and qty >= case_size)
+        # Check if eligible for case packaging (has valid case packaging and qty >= case_size)
         if case_size > 1 and qty >= case_size:
             cases_count = qty // case_size
             loose_count = qty % case_size
             
             unit_weight = float(it.get("weight", 0.0))
-            case_weight = round(unit_weight * case_size, 2)
+            case_weight = float(it.get("case_weight", round(unit_weight * case_size, 2)))
+            
+            l = float(it.get("length", 0.0))
+            w = float(it.get("width", 0.0))
+            h = float(it.get("height", 0.0))
+            case_l = float(it.get("case_length", l))
+            case_w = float(it.get("case_width", w))
+            case_h = float(it.get("case_height", h))
+            max_dim = max(case_l, case_w, case_h)
+            
+            # TASK-078: Check safety weight (<= 32.0kg) and max dimension (<= 150.0cm) [DOM-03]
+            is_overweight = case_weight > MAX_SIOC_WEIGHT_KG
+            is_oversized = max_dim > MAX_SIOC_DIMENSION_CM
+            requires_freight = is_overweight or is_oversized
             
             for c_idx in range(cases_count):
-                sioc_packages.append({
-                    "package_id": f"SIOC-{sku}-{c_idx + 1}",
-                    "package_type": "SIOC",
-                    "is_sioc": True,
-                    "sku_code": sku,
-                    "name": name,
-                    "case_index": c_idx + 1,
-                    "total_cases": cases_count,
-                    "quantity_per_case": case_size,
-                    "gross_weight_kg": case_weight,
-                    "shipping_label": f"SHIP-SIOC-{sku}-{c_idx + 1}",
-                    "instructions": "Dán nhãn vận chuyển trực tiếp lên thùng nguyên seal của nhà sản xuất (SIOC). Không đóng gói lại."
-                })
+                if requires_freight:
+                    sioc_packages.append({
+                        "package_id": f"FREIGHT-{sku}-{c_idx + 1}",
+                        "package_type": "FREIGHT_PALLET",
+                        "is_sioc": False,
+                        "requires_freight_pallet": True,
+                        "shipping_method": "FREIGHT_PALLET",
+                        "sku_code": sku,
+                        "name": name,
+                        "case_index": c_idx + 1,
+                        "total_cases": cases_count,
+                        "quantity_per_case": case_size,
+                        "gross_weight_kg": case_weight,
+                        "max_dimension_cm": max_dim,
+                        "shipping_label": f"FREIGHT-PALLET-{sku}-{c_idx + 1}",
+                        "instructions": (
+                            f"Kiện hàng vượt ngưỡng bưu kiện thông thường (khối lượng {case_weight}kg > {MAX_SIOC_WEIGHT_KG}kg "
+                            f"hoặc kích thước {max_dim}cm > {MAX_SIOC_DIMENSION_CM}cm). Bắt buộc đóng pallet và vận chuyển hàng nặng (FREIGHT_PALLET)."
+                        ),
+                    })
+                else:
+                    sioc_packages.append({
+                        "package_id": f"SIOC-{sku}-{c_idx + 1}",
+                        "package_type": "SIOC",
+                        "is_sioc": True,
+                        "requires_freight_pallet": False,
+                        "shipping_method": "PARCEL",
+                        "sku_code": sku,
+                        "name": name,
+                        "case_index": c_idx + 1,
+                        "total_cases": cases_count,
+                        "quantity_per_case": case_size,
+                        "gross_weight_kg": case_weight,
+                        "max_dimension_cm": max_dim,
+                        "shipping_label": f"SHIP-SIOC-{sku}-{c_idx + 1}",
+                        "instructions": "Dán nhãn vận chuyển trực tiếp lên thùng nguyên seal của nhà sản xuất (SIOC). Không đóng gói lại.",
+                    })
                 
             if loose_count > 0:
                 loose_item = dict(it)

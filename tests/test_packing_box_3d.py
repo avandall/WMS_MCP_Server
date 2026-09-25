@@ -756,3 +756,93 @@ def test_sioc_partition_via_uom_conversion():
     assert loose[0]["quantity"] == 1
 
 
+# ==============================================================================
+# TASK-078: SIOC Safety Limits (<= 32kg & <= 150cm) and Freight Pallet (DOM-03)
+# ==============================================================================
+
+def test_sioc_weight_limit_valid_15kg_vs_heavy_45kg():
+    """
+    Acceptance Criteria (TASK-078 / DOM-03):
+    Kiểm thử phân tách SIOC với:
+    - Kiện hàng 15kg (hợp lệ <= 32kg): Tạo nhãn SIOC bưu kiện thông thường (shipping_method = 'PARCEL', is_sioc = True).
+    - Kiện hàng 45kg (quá tải > 32kg): Bắt buộc yêu cầu pallet (shipping_method = 'FREIGHT_PALLET', requires_freight_pallet = True).
+    """
+    items = [
+        # Item 1: 15kg case (10 units x 1.5kg) -> Standard SIOC parcel
+        {
+            "sku_code": "SKU-LIGHT-CASE",
+            "name": "Standard Light Item Case",
+            "quantity": 10,
+            "case_size": 10,
+            "weight": 1.5,
+            "length": 30.0,
+            "width": 20.0,
+            "height": 20.0,
+        },
+        # Item 2: 45kg case (10 units x 4.5kg) -> Heavy item requiring pallet
+        {
+            "sku_code": "SKU-HEAVY-DUMBBELL",
+            "name": "Heavy Iron Dumbbell Case",
+            "quantity": 10,
+            "case_size": 10,
+            "weight": 4.5,
+            "length": 40.0,
+            "width": 30.0,
+            "height": 25.0,
+        },
+    ]
+
+    packages, loose = partition_sioc_items(items)
+
+    assert len(packages) == 2
+    assert len(loose) == 0
+
+    # Package 1: 15kg valid SIOC
+    pkg_15kg = next(p for p in packages if p["sku_code"] == "SKU-LIGHT-CASE")
+    assert pkg_15kg["gross_weight_kg"] == 15.0
+    assert pkg_15kg["is_sioc"] is True
+    assert pkg_15kg["package_type"] == "SIOC"
+    assert pkg_15kg["shipping_method"] == "PARCEL"
+    assert pkg_15kg["requires_freight_pallet"] is False
+    assert pkg_15kg["shipping_label"].startswith("SHIP-SIOC")
+
+    # Package 2: 45kg heavy case requiring freight pallet
+    pkg_45kg = next(p for p in packages if p["sku_code"] == "SKU-HEAVY-DUMBBELL")
+    assert pkg_45kg["gross_weight_kg"] == 45.0
+    assert pkg_45kg["is_sioc"] is False
+    assert pkg_45kg["package_type"] == "FREIGHT_PALLET"
+    assert pkg_45kg["shipping_method"] == "FREIGHT_PALLET"
+    assert pkg_45kg["requires_freight_pallet"] is True
+    assert pkg_45kg["shipping_label"].startswith("FREIGHT-PALLET")
+    assert "FREIGHT_PALLET" in pkg_45kg["instructions"]
+
+
+def test_sioc_weight_limit_oversized_dimension():
+    """
+    Acceptance Criteria (TASK-078 / DOM-03):
+    Kiện hàng kích thước vượt quá 150cm bị từ chối SIOC bưu kiện thông thường và yêu cầu pallet.
+    """
+    items = [
+        {
+            "sku_code": "SKU-OVERSIZED-PIPE",
+            "name": "Industrial Long Pipe",
+            "quantity": 5,
+            "case_size": 5,
+            "weight": 2.0,  # 5 * 2.0 = 10.0kg (under 32kg)
+            "length": 160.0,  # 160cm > 150cm (oversized)
+            "width": 20.0,
+            "height": 20.0,
+        }
+    ]
+
+    packages, loose = partition_sioc_items(items)
+    assert len(packages) == 1
+    pkg = packages[0]
+    assert pkg["gross_weight_kg"] == 10.0
+    assert pkg["max_dimension_cm"] == 160.0
+    assert pkg["requires_freight_pallet"] is True
+    assert pkg["shipping_method"] == "FREIGHT_PALLET"
+    assert pkg["package_type"] == "FREIGHT_PALLET"
+
+
+

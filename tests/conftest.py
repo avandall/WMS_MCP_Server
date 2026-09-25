@@ -201,6 +201,36 @@ def mock_grpc_client(monkeypatch):
     )
     mock_inventory.ConfirmInventoryTransaction.return_value = mock_confirm_response
     
+    # Mock CreateDraftProposal response (Maker-Checker workflow)
+    mock_proposal_row = inventory_pb2.DraftProposalRow(
+        proposal_id="PROP-TEST-001",
+        proposal_type="QUANTITY_UPDATE",
+        sku_code="SKU-TEST-001",
+        warehouse_id=1,
+        location_code="ZONE-A-ROW-01-SHELF-01",
+        current_quantity=100,
+        proposed_quantity=110,
+        adjustment=10,
+        reason="Test proposal",
+        requested_by="mcp-agent",
+        status="DRAFT_PROPOSAL",
+        created_at="2026-09-25T12:00:00Z"
+    )
+    mock_proposal_response = inventory_pb2.CreateDraftProposalResponse(
+        success=True,
+        message="Proposal created successfully",
+        proposal=mock_proposal_row
+    )
+    mock_inventory.CreateDraftProposal.return_value = mock_proposal_response
+
+    # Mock MoveLocationStock response (TASK-076)
+    mock_move_response = inventory_pb2.MoveLocationStockResponse(
+        success=True,
+        message="Stock moved successfully between locations",
+        transaction_id=999
+    )
+    mock_inventory.MoveLocationStock.return_value = mock_move_response
+    
     # Expose mocks on the singleton for individual test overrides
     grpc_client.mock_identity = mock_identity
     grpc_client.mock_customer = mock_customer
